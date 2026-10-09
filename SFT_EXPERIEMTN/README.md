@@ -125,6 +125,9 @@ for compressed filters because they defeat this parameterization.
 
 ## A100 SLURM grid
 
+For the B200 `mig90g` cluster and `/home/achyutm01/SFT/SFT_EXPERIEMTN`, use
+`bash run_block_sweep_b200.sh --training-budget fixed`. See [B200.md](B200.md).
+
 For a sweep over each individual block position 0..11, use
 `bash submit_block_sweep.sh --training-budget fixed` (60 Pets tasks).
 See [BLOCK_SWEEP.md](BLOCK_SWEEP.md) for early stopping, both budgets, all datasets

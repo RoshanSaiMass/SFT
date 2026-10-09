@@ -51,6 +51,13 @@ of invalid inputs before submission. `bash -n submit_block_sweep.sh` also passed
 The original trainer, worker and A100 batch script are unchanged by this addition;
 the new shell launcher is compatible with the originally uploaded experiment ZIP.
 
+B200 adaptation: `bash -n run_block_sweep_b200.sh` passed and
+`python -m pytest -q tests/test_b200_launcher.py` reported **6 passed in 0.38s**.
+The checks verify the supplied MIG resource directives, new folder path, removal
+of the A100 node constraint, two-task concurrency limit, budget/count manifests
+and compatibility with the existing worker. They use a fake scheduler; no B200
+job was submitted and no B200 runtime compatibility claim is made.
+
 ## Counted parameter savings
 
 `python parameter_report.py --out verification/parameter_report.csv` instantiated
