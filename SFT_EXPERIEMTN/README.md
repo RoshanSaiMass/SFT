@@ -125,6 +125,12 @@ for compressed filters because they defeat this parameterization.
 
 ## A100 SLURM grid
 
+For a sweep over each individual block position 0..11, use
+`bash submit_block_sweep.sh --training-budget fixed` (60 Pets tasks).
+See [BLOCK_SWEEP.md](BLOCK_SWEEP.md) for early stopping, both budgets, all datasets
+and the optional sweep over replacement counts 1..11. This additional launcher
+also works with the original uploaded experiment ZIP and existing batch file.
+
 Place this folder at `/export/home/achyut/Sarvesh/SFT_FINAL/SFT_EXPERIEMTN`.
 The launcher uses `gpu-a100`, `node1`, one GPU, 220G and 11:59:59 per task.
 `CONDA_ENV` defaults to `sft_env`; `CONDA_SH` may point to `conda.sh` explicitly.
@@ -168,7 +174,9 @@ Failed/missing runs are absent from the CSV; inspect task statuses and SLURM log
 
 ## Verification
 
-All 206 CPU tests passed. See `verification/REPORT.md` for results and limitations. No cluster job was
+Initial model verification passed 206 CPU tests; the block-sweep launcher passed
+10 additional checks using a fake scheduler. See `verification/REPORT.md` for
+results and limitations. No cluster job was
 submitted and no real-data accuracy claim is made. For scientific comparison,
 run the dense controls and compressed candidates on identical splits/budgets,
 then repeat promising configurations across several seeds.

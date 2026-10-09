@@ -37,6 +37,20 @@ This includes the 118 reviewed-baseline tests and 88 additional experiment tests
 `bash -n submit.sh experiment.sbatch` passed, and the trainer's `--help` completed.
 No SLURM job was submitted.
 
+Additional block-sweep launcher checks:
+
+```
+python -m pytest -q tests/test_block_sweep_launcher.py
+10 passed in 0.60s
+```
+
+These use a fake `sbatch` command and never contact a cluster. They check 60/60/120
+tasks for fixed/early/both, all positions 0..11, all eligible counts 1..11 (55 tasks),
+dataset/seed multipliers, distinct outputs, correct manual/SNIP flags and rejection
+of invalid inputs before submission. `bash -n submit_block_sweep.sh` also passed.
+The original trainer, worker and A100 batch script are unchanged by this addition;
+the new shell launcher is compatible with the originally uploaded experiment ZIP.
+
 ## Counted parameter savings
 
 `python parameter_report.py --out verification/parameter_report.csv` instantiated
