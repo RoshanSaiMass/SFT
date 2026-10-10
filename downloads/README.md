@@ -1,9 +1,9 @@
 # Downloadable SNIP compact source
 
 `SFT-snip-compact.zip` contains the source tree at commit
-`cd13e5b421be81519d04d910f8fdddf8e8343efd`, with top-level directory `SFT-snip-compact/`.
+`75dcde4e6409d0eac56ae569f546144cb864f2a4`, with top-level directory `SFT-snip-compact/`.
 
-SHA256: `beb0f52d9f2644448168cbc3a79aeca1517c86bc76b547e035d057b1dfa53156`
+SHA256: `f450e101fb45285695c185e7a063e25c4793177fee7686ba37412f21a98ed8ca`
 
 This includes the new `SFT_SNIP_COMPACT` workflow, common CLI, tests and unchanged
 existing backends. It excludes the downloads directory, datasets, pretrained
@@ -12,7 +12,8 @@ the extracted CLI was checked for both new training and evaluation entry points.
 
 Open the ZIP on GitHub branch `sft-snip-compact` and use the download button, or
 choose Code / Download ZIP for that branch. Use `run.py snip-compact` to run the
-new method. The older `SFT-integrated.zip` remains available for the previous
+new method. This version uses original-ViT SNIP for PEFT targeting and
+separate paper-style candidate-network SNIP for compact placement. The older `SFT-integrated.zip` remains available for the previous
 integrated codebase; it does not include this new workflow.
 
 ---
