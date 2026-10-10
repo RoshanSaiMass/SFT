@@ -1,0 +1,1420 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _simulate_quantize_dequantize(W: torch.Tensor, bits: int = 4) -> torch.Tensor:
+    """
+    Dependency-free stand-in for the quantization step LoftQ's init procedure needs.
+
+    Real LoftQ/QLoRA implementations quantize to NF4 (a non-uniform, information-
+    theoretically-motivated 4-bit codebook) via bitsandbytes' CUDA kernels. This repo
+    intentionally avoids that dependency (bitsandbytes needs a working CUDA build
+    matched to the exact torch/CUDA version, and offline compute nodes -- like a
+    SLURM cluster with no internet access on the compute nodes -- often can't `pip
+    install` it at all). Instead, this does simple per-tensor uniform affine
+    quantization: linearly map W's [min, max] range onto 2**bits integer levels,
+    then map back to float. This captures the CORE idea LoftQ's init needs
+    (quantization loses information; the low-rank adapter should be initialized to
+    approximate what was lost, not started from an unrelated random point) without
+    matching NF4's bit-exact behavior. Treat --init-method loftq as an approximation
+    of the paper's IDEA, not a reproduction of its exact numbers.
+    """
+    with torch.no_grad():
+        w_min, w_max = W.min(), W.max()
+        levels = 2 ** bits
+        if (w_max - w_min).item() == 0.0:
+            return W.clone()
+        scale = (w_max - w_min) / (levels - 1)
+        q = torch.round((W - w_min) / scale)
+        q = torch.clamp(q, 0, levels - 1)
+        return q * scale + w_min
+
+
+class LoRALinear(nn.Module):
+    """
+    Wraps an existing nn.Linear layer with a low-rank adapter. Supports two adapter
+    architectures (adapter_type) and two initialization schemes (init_method),
+    independently combinable:
+
+    adapter_type="lora" (default): standard LoRA,
+        W' = W_base + scaling * (B @ A)
+
+    adapter_type="dora": Weight-Decomposed Low-Rank Adaptation. Decomposes the
+    EFFECTIVE weight into a trainable per-output-neuron magnitude vector `m` and a
+    direction that LoRA's low-rank update reshapes:
+        V'    = W_base + scaling * (B @ A)                    # same as LoRA's W'
+        W'    = m * V' / ||V'||_row                            # m: (out_features,)
+    where ||.||_row is the L2 norm of each output neuron's row (dim=1), matching the
+    convention used elsewhere (e.g. Hugging Face PEFT's DoRA). `m` is initialized to
+    W_base's own row norms, so W' = W_base exactly at init (same "no-op at init"
+    property LoRA gets from zero-initializing B). Adds `out_features` extra
+    trainable scalars per layer -- negligible parameter cost -- and empirically
+    tends to track full fine-tuning's update direction more closely than plain LoRA.
+
+    init_method="default" (unchanged): lora_A ~ Kaiming-uniform, lora_B = 0.
+
+    init_method="loftq": see _loftq_init below -- alternating quantize/SVD-residual
+    fit, replacing base_layer's weight with a quantized version and initializing
+    lora_A/lora_B to approximate what quantization lost, instead of starting from a
+    near-zero effective update.
+    """
+    def __init__(self, base_layer: nn.Linear, rank: int = 16, alpha: float = 32.0, dropout: float = 0.0,
+                 apply_ortho: bool = True, adapter_type: str = "lora", init_method: str = "default",
+                 loftq_bits: int = 4, loftq_iters: int = 5):
+        super().__init__()
+        assert adapter_type in ("lora", "dora"), f"adapter_type must be 'lora' or 'dora', got {adapter_type!r}"
+        assert init_method in ("default", "loftq"), f"init_method must be 'default' or 'loftq', got {init_method!r}"
+        if rank < 0:
+            raise ValueError("Adapter rank must be nonnegative")
+        if init_method == "loftq" and rank > 0:
+            if rank > min(base_layer.in_features, base_layer.out_features):
+                raise ValueError("LoftQ rank cannot exceed the projection's smaller dimension")
+            if alpha <= 0 or loftq_bits < 1 or loftq_iters < 1:
+                raise ValueError("LoftQ requires positive alpha, bits >= 1, and iterations >= 1")
+        self.base_layer = base_layer
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank if rank > 0 else 1.0
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+        self.adapter_type = adapter_type
+        self.init_method = init_method
+        # Whether compute_lora_orthogonality_loss should include this layer.
+        # Lets a subset of LoRA-wrapped layers use the orthogonality regularizer
+        # ("SFT+LoRA-ortho") while the rest behave as plain LoRA -- e.g. restricting
+        # the (more expensive/restrictive) orthogonality penalty to only the blocks
+        # most sensitive to the downstream task (see select_top_sensitive_blocks
+        # below), rather than applying it uniformly across every LoRA layer in the
+        # network. Default True preserves the old all-layers behavior for any
+        # existing code that doesn't pass this explicitly.
+        self.apply_ortho = apply_ortho
+
+        if rank > 0:
+            # IMPORTANT: match base_layer.weight's device/dtype here, not just
+            # leave these as default CPU float32 tensors. Plain LoRA gets away
+            # with skipping this (nothing touches lora_A/lora_B until the whole
+            # model's later .to(device) call), but DoRA's magnitude init below
+            # computes with base_layer.weight IMMEDIATELY, inside __init__ --
+            # if the model was already moved to GPU before inject_lora() runs
+            # (the normal case: train_sfp_lora.py does model.to(device) early,
+            # then injects LoRA/DoRA afterward), base_layer.weight is already on
+            # cuda while a device-less torch.zeros(...) defaults to cpu, causing
+            # "Expected all tensors to be on the same device" at this exact line.
+            base_device = base_layer.weight.device
+            base_dtype = base_layer.weight.dtype
+            self.lora_A = nn.Parameter(torch.zeros(rank, base_layer.in_features,
+                                                     device=base_device, dtype=base_dtype))
+            self.lora_B = nn.Parameter(torch.zeros(base_layer.out_features, rank,
+                                                     device=base_device, dtype=base_dtype))
+            self.reset_parameters()
+
+            if init_method == "loftq":
+                self._loftq_init(bits=loftq_bits, n_iters=loftq_iters)
+
+            if adapter_type == "dora":
+                # Row norm of the EFFECTIVE weight at this point (== base_layer's
+                # weight if init_method="default" since B=0 there; == the
+                # quantized+residual-fit weight if init_method="loftq"). Either
+                # way, initializing m to this row norm makes W' == the current
+                # effective weight exactly at init.
+                with torch.no_grad():
+                    V0 = self.base_layer.weight + self.scaling * (self.lora_B @ self.lora_A)
+                    row_norm = V0.norm(p=2, dim=1)  # (out_features,)
+                self.magnitude = nn.Parameter(row_norm)
+
+    def reset_parameters(self):
+        if self.rank > 0:
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+    @torch.no_grad()
+    def _loftq_init(self, bits: int = 4, n_iters: int = 5):
+        """
+        Alternating quantize / SVD-residual-fit initialization (approximates the
+        LoftQ paper's Algorithm 1; see _simulate_quantize_dequantize for the
+        quantization-backend caveat).
+
+        For n_iters rounds:
+          1. quantize the current residual R = W_base - B@A  ->  Q
+          2. take the low-rank SVD of what Q couldn't capture, W_base - Q, and
+             refit B@A to approximate it (top-`rank` singular directions)
+        After the loop, base_layer.weight is REPLACED by the final Q (frozen, as
+        always), and lora_A/lora_B hold the low-rank fit to (W_base - Q) -- so
+        Q + B@A approximates the original full-precision W_base as closely as this
+        rank/bit-width combination allows, rather than starting from B=0 (i.e. an
+        effective update of exactly zero, as in default init) on top of a
+        quantized base_layer.weight (which is how naive QLoRA initializes: better
+        than nothing, but LoftQ's whole point is that alternating with the SVD fit
+        gets a measurably tighter approximation).
+        """
+        W = self.base_layer.weight.data.clone()
+        BA = torch.zeros_like(W)
+        # Fallback defaults in case SVD fails on the very first iteration (rare, but
+        # possible on a pathological all-zero or near-singular residual) -- keeps
+        # the layer at its safe default-init state (zero effective update, original
+        # full-precision weight) instead of crashing the whole run.
+        B_new, A_new = self.lora_B.data.clone(), self.lora_A.data.clone()
+        Q_final = W.clone()
+
+        for _ in range(n_iters):
+            # Quantize what the low-rank term (from the previous round) doesn't
+            # already capture, then re-fit the low-rank term via SVD of (W - Q) --
+            # i.e. what's left of the ORIGINAL weight after subtracting this
+            # round's quantized approximation, NOT (residual - Q). Fitting against
+            # (residual - Q) instead of (W - Q) was tried first and verified (via a
+            # numpy prototype) to make the reconstruction error oscillate instead
+            # of converge across iterations; (W - Q) converges monotonically-ish
+            # and consistently beats naive single-shot quantization.
+            residual = W - BA
+            Q = _simulate_quantize_dequantize(residual, bits=bits)
+            target_for_svd = W - Q
+            try:
+                U, S, Vh = torch.linalg.svd(target_for_svd, full_matrices=False)
+            except RuntimeError:
+                break
+            r = self.rank
+            U_r, S_r, Vh_r = U[:, :r], S[:r], Vh[:r, :]
+            sqrt_S_r = torch.sqrt(S_r.clamp(min=0.0))
+            B_new = U_r * sqrt_S_r.unsqueeze(0)          # (out_features, rank)
+            A_new = sqrt_S_r.unsqueeze(1) * Vh_r          # (rank, in_features)
+            BA = B_new @ A_new
+            Q_final = Q
+
+        # Absorb the fixed scaling factor now so that forward()'s
+        # self.scaling * (B @ A) reproduces BA exactly (B_new @ A_new above is the
+        # raw residual fit, not yet divided by this layer's LoRA scaling factor).
+        # self.scaling is always > 0 here (rank > 0 is guaranteed by the caller).
+        sqrt_scaling = math.sqrt(self.scaling)
+        self.lora_B.data.copy_(B_new / sqrt_scaling)
+        self.lora_A.data.copy_(A_new / sqrt_scaling)
+        self.base_layer.weight.data.copy_(Q_final)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.rank <= 0:
+            return self.base_layer(x)
+
+        if self.adapter_type == "lora":
+            result = self.base_layer(x)
+            lora_out = F.linear(self.dropout(x), self.lora_A)
+            lora_out = F.linear(lora_out, self.lora_B)
+            return result + self.scaling * lora_out
+
+        # Dropout affects the low-rank input, not the pretrained projection.
+        # With B=0 this preserves the base layer even in training mode.
+        delta = self.scaling * (self.lora_B @ self.lora_A)
+        V = self.base_layer.weight + delta
+        row_norm = V.norm(p=2, dim=1).clamp(min=1e-8)
+        scale = self.magnitude / row_norm
+        result = F.linear(x, self.base_layer.weight) + F.linear(self.dropout(x), delta)
+        result = result * scale
+        if self.base_layer.bias is not None:
+            result = result + self.base_layer.bias
+        return result
+
+    def orthogonality_penalty(self):
+        """
+        Returns (A_term, B_term), the (rank x rank) residual matrices whose squared
+        Frobenius norm, NORMALIZED BY rank^2, penalizes lora_A / lora_B for being
+        far from row/column-orthonormal. None if rank <= 0 (no LoRA params to
+        regularize on this layer).
+
+        Shapes: lora_A is (rank, in_features), lora_B is (out_features, rank), with
+        rank << in_features/out_features. Because of that, lora_A can only ever have
+        AT MOST `rank` linearly independent directions among its in_features-dim rows
+        -- so the meaningful orthogonality constraint is on those `rank` ROWS being
+        mutually orthonormal, i.e. A @ A.T ~ I_rank (a (rank x rank) identity is
+        achievable; forcing A.T @ A, which is (in_features x in_features) and has
+        rank <= rank < in_features, could never equal an identity matrix).
+        Symmetrically for lora_B, whose `rank` COLUMNS are the quantity that can be
+        made orthonormal: B.T @ B ~ I_rank.
+
+        Driving both toward the identity pushes each adapter's `rank` update
+        directions to be linearly independent of one another, i.e. discourages the
+        adapter from wasting capacity by learning redundant (near-parallel) columns.
+
+        NORMALIZATION: A_term/B_term are (rank x rank) matrices, so their raw
+        squared Frobenius norm scales with O(rank^2) even at a FIXED relative
+        deviation from orthonormality (e.g. lora_B starts at exactly zero, so
+        B_term = -I_rank and ||B_term||_F^2 = rank at initialization alone, before
+        any training). Dividing by rank^2 here turns this into a mean squared
+        per-entry deviation, so a given --lora-ortho-lambda1/2 value means roughly
+        the same regularization STRENGTH regardless of --lora-rank -- previously,
+        doubling --lora-rank would roughly double the raw penalty at the same
+        actual orthonormality, silently requiring the lambda to be re-tuned every
+        time --lora-rank changed.
+        """
+        if self.rank <= 0:
+            return None
+        eye_r = torch.eye(self.rank, device=self.lora_A.device, dtype=self.lora_A.dtype)
+        A_term = (self.lora_A @ self.lora_A.t() - eye_r) / self.rank   # (rank, rank), pre-normalized
+        B_term = (self.lora_B.t() @ self.lora_B - eye_r) / self.rank   # (rank, rank), pre-normalized
+        return A_term, B_term
+
+
+def compute_lora_orthogonality_loss(model: nn.Module, lambda1: float = 0.0, lambda2: float = 0.0) -> torch.Tensor:
+    """
+    Averages (not sums) the orthogonality regularizer
+    lambda1 * ||A@A.T - I||_F^2 + lambda2 * ||B.T@B - I||_F^2 (each pre-normalized
+    by rank -- see LoRALinear.orthogonality_penalty) over every LoRALinear
+    submodule in `model` that has rank > 0 AND apply_ortho=True (module.apply_ortho
+    defaults to True, so with no selective marking this covers every LoRA layer,
+    exactly as before this flag existed; see inject_lora's ortho_block_indices
+    param and select_top_sensitive_blocks for how to mark only a subset).
+
+    NORMALIZATION: this now AVERAGES across LoRA-wrapped layers instead of
+    SUMMING. Summing meant the total penalty magnitude scaled with however many
+    linear layers happened to have LoRA injected into them (e.g. it changes with
+    --num-filter-blocks, or with target_keywords covering more/fewer sublayers),
+    so the same lambda value applied a very different effective regularization
+    strength on a shallow vs. a deep injection pattern. Averaging makes
+    --lora-ortho-lambda1/2 behave consistently across those configuration
+    choices, so it's tunable as "how strongly do I want each adapter regularized"
+    rather than "how strongly do I want the WHOLE MODEL regularized, which
+    happens to depend on how many layers got LoRA".
+
+    Returns a 0-dim tensor on the same device as the model's parameters, so it can
+    always be added directly to the task loss (returns exactly 0.0, with no graph
+    attached to lora_A/lora_B, when both lambdas are 0 -- the default -- so runs
+    that don't pass either flag are numerically unaffected).
+
+    NOTE ON EXISTING --lora-ortho-lambda1/2 VALUES: because this normalizes both
+    by rank (per-term) and by layer count (via the average), the same lambda
+    value now produces a MUCH SMALLER raw loss contribution than before this
+    change (previously, the unnormalized sum could already be comparable in
+    magnitude to the task loss itself right at initialization -- see module
+    docstring). If you were already using e.g. --lora-ortho-lambda1 0.01
+    --lora-ortho-lambda2 0.01, you will likely want to increase both by roughly
+    one to two orders of magnitude (e.g. try 0.1-1.0) to get a comparable
+    regularization STRENGTH to what the old unnormalized version applied --
+    the old values weren't wrong, they just meant something different (and less
+    reliably reproducible) than they will now.
+    """
+    device = next(model.parameters()).device
+    total = torch.zeros((), device=device)
+    if lambda1 == 0.0 and lambda2 == 0.0:
+        return total
+
+    n_layers = 0
+    for module in model.modules():
+        if isinstance(module, (LoRALinear, PaCAAdapterLinear)) and module.rank > 0 and module.apply_ortho:
+            terms = module.orthogonality_penalty()
+            if terms is None:
+                continue
+            A_term, B_term = terms
+            layer_loss = torch.zeros((), device=device)
+            if lambda1 != 0.0:
+                layer_loss = layer_loss + lambda1 * torch.sum(A_term * A_term)
+            if lambda2 != 0.0:
+                layer_loss = layer_loss + lambda2 * torch.sum(B_term * B_term)
+            total = total + layer_loss
+            n_layers += 1
+
+    if n_layers > 0:
+        total = total / n_layers
+    return total
+
+
+class FilterResidualMLP(nn.Module):
+    """
+    Optional nonlinear residual branch for a filter block: fc2(GELU(fc1(x))).
+
+    fc2 is ZERO-INITIALIZED (weight and bias), so this branch contributes EXACTLY
+    ZERO at initialization -- the same safe-start trick LoRALinear already uses for
+    its own lora_B matrix. This means attaching this branch to a filter block does
+    NOT disturb that block's pseudoinverse-inherited behavior at step 1; the branch
+    can only start contributing once gradients move fc2 away from zero during
+    training.
+
+    fc1 keeps its default (random) init. This is fine precisely because fc2 starts
+    at zero: whatever fc1 outputs gets multiplied by zero at fc2 regardless, so a
+    random fc1 can't destabilize anything at initialization.
+
+    Unlike the purely-linear --filter-block-layers stack, this branch genuinely
+    adds expressivity (the GELU nonlinearity means fc2(GELU(fc1(x))) is NOT
+    reducible to a single linear map) -- this is the mechanism for real added
+    capacity in the filter block, implemented as a safe zero-init residual rather
+    than by making the block's main path nonlinear (which would break the
+    closed-form pseudoinverse init and risk destabilizing the inherited behavior).
+
+    scaling = alpha / hidden_dim, mirroring LoRALinear's alpha/rank normalization:
+    keeps the branch's effective update magnitude comparable across different
+    hidden_dim choices once it does start contributing.
+    """
+
+    def __init__(self, embed_dim: int, hidden_dim: int, alpha: float = 1.0, dropout: float = 0.0):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.alpha = alpha
+        self.scaling = alpha / hidden_dim if hidden_dim > 0 else 1.0
+
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.fc2(self.act(self.fc1(x)))
+        return self.scaling * self.dropout(out)
+
+
+class SingleFilterBlock(nn.Module):
+    """
+    Single linear filter block replacing a pruned Transformer block.
+    Initialized via Moore–Penrose pseudoinverse (paper Eq. 3-4).
+
+    Optionally attaches a nonlinear zero-init residual branch (FilterResidualMLP)
+    when residual_hidden_dim > 0 -- see that class's docstring for why this is the
+    safe way to add genuine nonlinear capacity without disturbing the pseudoinverse
+    init. Default (residual_hidden_dim=0) is UNCHANGED from all previous versions:
+    no residual submodule is constructed at all, so state_dict keys for existing
+    checkpoints trained without this feature still match exactly.
+    """
+    def __init__(self, embed_dim: int, dropout: float = 0.0,
+                 residual_hidden_dim: int = 0, residual_alpha: float = 1.0, residual_dropout: float = 0.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.eye(embed_dim))
+        self.bias = nn.Parameter(torch.zeros(embed_dim))
+        self.dropout = nn.Dropout(p=dropout)
+
+        self.residual = None
+        if residual_hidden_dim > 0:
+            self.residual = FilterResidualMLP(
+                embed_dim=embed_dim, hidden_dim=residual_hidden_dim,
+                alpha=residual_alpha, dropout=residual_dropout,
+            )
+
+    def init_from_pinv(self, X_in: torch.Tensor, X_out: torch.Tensor):
+        """
+        Fits matrix W such that X_in @ W ≈ X_out. Only touches the main linear
+        path (self.weight/self.bias) -- the residual branch (if present) stays at
+        its zero-init starting point regardless, exactly as intended.
+        """
+        with torch.no_grad():
+            X_in_flat = X_in.reshape(-1, X_in.size(-1)).double()
+            X_out_flat = X_out.reshape(-1, X_out.size(-1)).double()
+
+            # Paper Eq. 4: no ridge regularizer or normal-equation solve.
+            pinv = torch.linalg.pinv(X_in_flat) @ X_out_flat
+
+            self.weight.copy_(pinv.T.to(self.weight.dtype))
+            self.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.linear(x, self.weight, self.bias)
+        if self.residual is not None:
+            out = out + self.residual(x)
+        return self.dropout(out)
+
+
+class MultiLayerFilterBlock(nn.Module):
+    """
+    N-layer (N >= 2) generalization of SingleFilterBlock's linear filter block.
+
+    IMPORTANT: the stacked layers themselves are purely linear (no activation
+    between them), so stacking them does NOT add expressivity beyond a single
+    layer -- the composed transformation is mathematically still just one linear
+    map (matrix product collapses). This class exists to let you experiment with
+    depth/parameterization while preserving the EXACT SAME inheritance property as
+    the single-layer case. For genuine added capacity, attach a nonlinear
+    zero-init residual branch instead (residual_hidden_dim > 0 -- see
+    FilterResidualMLP's docstring); that's a separate, safer mechanism than making
+    this stack itself nonlinear, since it doesn't disturb the closed-form
+    pseudoinverse init.
+
+    Weight initialization generalizes the paper's pseudoinverse trick (Eq. 3-4) to
+    N layers as follows:
+      - Solve the SAME problem as the single-layer case: min_W ||X_in@W - X_out||_F^2
+        -> W = X_in^+ @ X_out
+      - Initialize exactly ONE layer (the last one, closest to the block's output)
+        with W and zero bias -- identical to SingleFilterBlock's own init
+      - Initialize every OTHER layer to the identity transform (identity weight
+        matrix, zero bias)
+      - Composing identity maps changes nothing, so the WHOLE STACK's product is
+        IDENTICAL to a single layer initialized with W, regardless of N. This
+        exactly preserves the "inherits the original block's behavior" property
+        at any depth.
+    """
+
+    def __init__(self, embed_dim: int, num_layers: int, dropout: float = 0.0,
+                 residual_hidden_dim: int = 0, residual_alpha: float = 1.0, residual_dropout: float = 0.0):
+        super().__init__()
+        assert num_layers >= 2, "MultiLayerFilterBlock requires num_layers >= 2 (use SingleFilterBlock for 1)"
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+
+        self.layers = nn.ModuleList([nn.Linear(embed_dim, embed_dim) for _ in range(num_layers)])
+        # Identity-init every layer up front, so the block is at least a
+        # well-behaved no-op even before init_from_pinv() is called (rather than
+        # torch's default random nn.Linear init).
+        with torch.no_grad():
+            for layer in self.layers:
+                layer.weight.copy_(torch.eye(embed_dim))
+                layer.bias.zero_()
+
+        self.dropout = nn.Dropout(p=dropout)
+
+        self.residual = None
+        if residual_hidden_dim > 0:
+            self.residual = FilterResidualMLP(
+                embed_dim=embed_dim, hidden_dim=residual_hidden_dim,
+                alpha=residual_alpha, dropout=residual_dropout,
+            )
+
+    def init_from_pinv(self, X_in: torch.Tensor, X_out: torch.Tensor):
+        """
+        Fits W such that X_in @ W ~= X_out (same as SingleFilterBlock.init_from_pinv),
+        assigns W to the LAST layer, and resets every other layer to identity. See
+        class docstring for why this exactly generalizes the single-layer inheritance
+        property to any depth.
+        """
+        with torch.no_grad():
+            X_in_flat = X_in.reshape(-1, X_in.size(-1)).double()
+            X_out_flat = X_out.reshape(-1, X_out.size(-1)).double()
+
+            # Paper Eq. 4: no ridge regularizer or normal-equation solve.
+            pinv = torch.linalg.pinv(X_in_flat) @ X_out_flat
+            W = pinv.T.to(self.layers[0].weight.dtype)
+
+            for layer in self.layers[:-1]:
+                layer.weight.copy_(torch.eye(self.embed_dim, device=W.device, dtype=W.dtype))
+                layer.bias.zero_()
+            self.layers[-1].weight.copy_(W)
+            self.layers[-1].bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual_input = x  # residual branch sees the block's ORIGINAL input, not the stacked-layer intermediate
+        for layer in self.layers:
+            x = layer(x)
+        if self.residual is not None:
+            x = x + self.residual(residual_input)
+        return self.dropout(x)
+
+
+def make_filter_block(embed_dim: int, num_layers: int = 1, dropout: float = 0.0,
+                       residual_hidden_dim: int = 0, residual_alpha: float = 1.0, residual_dropout: float = 0.0):
+    """
+    Factory: returns SingleFilterBlock for num_layers==1 (unchanged, backward
+    compatible with all existing checkpoints), or MultiLayerFilterBlock for
+    num_layers > 1. residual_hidden_dim > 0 attaches a nonlinear zero-init
+    residual branch to either (see FilterResidualMLP); default 0 = no residual
+    branch, fully backward compatible.
+    """
+    if num_layers <= 1:
+        return SingleFilterBlock(embed_dim=embed_dim, dropout=dropout,
+                                  residual_hidden_dim=residual_hidden_dim,
+                                  residual_alpha=residual_alpha, residual_dropout=residual_dropout)
+    return MultiLayerFilterBlock(embed_dim=embed_dim, num_layers=num_layers, dropout=dropout,
+                                  residual_hidden_dim=residual_hidden_dim,
+                                  residual_alpha=residual_alpha, residual_dropout=residual_dropout)
+
+
+def _normalize_indices(block_idx_or_indices) -> set:
+    """Accepts a single int or any iterable of ints; always returns a set of ints."""
+    if isinstance(block_idx_or_indices, int):
+        return {block_idx_or_indices}
+    return set(block_idx_or_indices)
+
+
+def adapter_parameter_ids(model: nn.Module) -> set:
+    """Registered adaptation parameters, excluding frozen child base layers.
+
+    Includes standalone DoRA magnitude and the single shared Uni-LoRA vector.
+    Module ownership avoids dependence on spelling in parameter names.
+    """
+    kinds = (LoRALinear, PaCALinear, PaCAAdapterLinear, UniLoRAAdapterLinear, UniLoRABank)
+    return {id(p) for module in model.modules() if isinstance(module, kinds)
+            for p in module.parameters(recurse=False)}
+
+
+def count_parameter_breakdown(model: nn.Module, pruned_block_idx=None) -> dict:
+    """Logical model counts, including PaCA weights stored as buffers.
+
+    The legacy 'lora' bucket includes every adaptation family. Selected direct
+    PaCA columns count once; projection index/normalization buffers are metadata.
+    This measures logical parameters, not actual tensor-storage memory usage.
+    """
+    indices = _normalize_indices(pruned_block_idx) if pruned_block_idx is not None else set()
+    adapter_ids = adapter_parameter_ids(model)
+    norm_ids = {id(p) for m in model.modules() if isinstance(m, nn.LayerNorm) for p in m.parameters()}
+    counts = {key: 0 for key in ('filter_block', 'lora', 'layernorm', 'head',
+                                'trainable_backbone', 'frozen_backbone')}
+    trainable = 0
+    for name, param in model.named_parameters():
+        n = param.numel()
+        if param.requires_grad:
+            trainable += n
+        if any(name.startswith(f'blocks.{i}.') for i in indices):
+            key = 'filter_block'
+        elif id(param) in adapter_ids:
+            key = 'lora'
+        elif id(param) in norm_ids:
+            key = 'layernorm'
+        elif name.startswith('head.'):
+            key = 'head'
+        elif param.requires_grad:
+            key = 'trainable_backbone'
+        else:
+            key = 'frozen_backbone'
+        counts[key] += n
+    for module in model.modules():
+        if isinstance(module, (PaCALinear, PaCAAdapterLinear)):
+            frozen = module.frozen_weight.numel()
+            if isinstance(module, PaCALinear):
+                frozen -= module.paca_weight.numel()
+            if module.paca_bias is not None:
+                frozen += module.paca_bias.numel()
+            counts['frozen_backbone'] += frozen
+    total = sum(counts.values())
+    counts.update(total_params=total, trainable_params=trainable,
+                  trainable_pct=100.0 * trainable / total if total else 0.0)
+    return counts
+
+
+def substitute_filter_block(model: nn.Module, block_idx: int, num_layers: int = 1, dropout: float = 0.0,
+                             residual_hidden_dim: int = 0, residual_alpha: float = 1.0, residual_dropout: float = 0.0):
+    """
+    Replaces model.blocks[block_idx] with a fresh filter block (SingleFilterBlock
+    if num_layers==1, MultiLayerFilterBlock otherwise). Does NOT perform the
+    pseudoinverse init -- call .init_from_pinv(X_in, X_out) on the returned module
+    afterward, using block inputs/outputs extracted from the model's CURRENT state.
+
+    For multi-block runs, substitute blocks in INCREASING index order and extract
+    each block's I/O data AFTER earlier substitutions have already happened, so
+    later filter blocks correctly learn to map from the already-modified preceding
+    representations (mirrors the paper's own sequential dual-layer construction,
+    Fig. 3).
+
+    residual_hidden_dim > 0 attaches a nonlinear zero-init residual branch to the
+    filter block (see FilterResidualMLP) -- default 0 = no residual branch.
+    """
+    embed_dim = getattr(model, "embed_dim", 768)
+    filter_block = make_filter_block(embed_dim=embed_dim, num_layers=num_layers, dropout=dropout,
+                                      residual_hidden_dim=residual_hidden_dim,
+                                      residual_alpha=residual_alpha, residual_dropout=residual_dropout)
+    model.blocks[block_idx] = filter_block
+    return filter_block
+
+
+def compute_block_target_param_count(block: nn.Module, target_keywords: list = ["qkv", "proj", "fc1", "fc2"]) -> int:
+    """
+    Sums weight+bias parameter counts over every nn.Linear submodule of `block`
+    whose name matches target_keywords -- i.e. the same set of layers inject_lora
+    would wrap with adapters. Used to answer "how many parameters would full
+    fine-tuning have trained in this block's target layers", as the reference
+    point for --compensate-params: how many parameters were LOST by replacing this
+    block with a (typically much smaller) filter block, that we then try to
+    compensate for by adding extra LoRA/DoRA rank to the OTHER blocks.
+
+    Call this BEFORE substitute_filter_block replaces the block -- afterward, the
+    original Linear layers no longer exist to count.
+    """
+    total = 0
+    for name, module in block.named_modules():
+        if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+            total += module.weight.numel()
+            if module.bias is not None:
+                total += module.bias.numel()
+    return total
+
+
+def compute_compensated_rank(
+    model: nn.Module,
+    excluded_block_indices,
+    base_rank: int,
+    param_deficit: int,
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+) -> dict:
+    """
+    Solves for a LoRA/DoRA rank >= base_rank such that the EXTRA adapter
+    parameters added (relative to base_rank) across every LoRA-eligible layer in
+    every non-excluded block approximately covers param_deficit -- the parameter
+    "budget" lost by replacing a block with a smaller filter block (see
+    compute_block_target_param_count).
+
+    Each target Linear layer of shape (out_features, in_features) costs
+    (in_features + out_features) extra parameters per +1 rank (that's exactly
+    lora_A's and lora_B's per-rank-unit size: lora_A row is in_features long,
+    lora_B column is out_features long). Summing that over every target layer in
+    every non-excluded block gives a total "cost per rank unit"; dividing the
+    deficit by that gives how many EXTRA ranks are needed.
+
+    NOTE: this only accounts for the rank-DEPENDENT cost. DoRA's per-layer
+    magnitude vector (out_features per layer) is a separate, rank-INDEPENDENT
+    fixed cost that doesn't change with rank, so it's intentionally excluded from
+    this "cost per rank unit" calculation (including it would bias the solved
+    rank without actually helping compensate proportionally to the deficit).
+
+    Returns {"compensated_rank": int, "cost_per_rank_unit": int, "extra_rank": int}.
+    If param_deficit <= 0 (filter block wasn't actually smaller, or --compensate-params
+    is being used somewhere it doesn't make sense), returns base_rank unchanged.
+    """
+    excluded = _normalize_indices(excluded_block_indices)
+    cost_per_rank_unit = 0
+    for idx, block in enumerate(model.blocks):
+        if idx in excluded:
+            continue
+        for name, module in block.named_modules():
+            if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+                cost_per_rank_unit += module.in_features + module.out_features
+
+    if param_deficit <= 0 or cost_per_rank_unit <= 0:
+        return {"compensated_rank": base_rank, "cost_per_rank_unit": cost_per_rank_unit, "extra_rank": 0}
+
+    extra_rank = math.ceil(param_deficit / cost_per_rank_unit)
+    return {
+        "compensated_rank": base_rank + extra_rank,
+        "cost_per_rank_unit": cost_per_rank_unit,
+        "extra_rank": extra_rank,
+    }
+
+
+def select_top_sensitive_blocks(saliencies: dict, excluded_indices, num_blocks: int) -> list:
+    """
+    Picks the `num_blocks` block indices with the HIGHEST SNIP saliency among
+    candidates NOT already in excluded_indices (the filter-substituted blocks).
+
+    Context: SNIP saliency (see snip_selection.py) measures |grad * weight| summed
+    per block -- roughly, "how much would the task loss change if this block's
+    weights were perturbed". Filter-block selection already uses the LOWEST-
+    saliency blocks (keep='low': the least task-sensitive / most redundant blocks
+    are the ones considered safe to replace). This function does the opposite at
+    the OTHER end of that same ranking: among the blocks that keep their original
+    weights (i.e. get LoRA rather than being replaced), it identifies the
+    num_blocks blocks the task is MOST sensitive to.
+
+    Returned indices are meant to be passed as inject_lora's ortho_block_indices,
+    so those specific blocks' LoRA adapters get the orthogonality regularizer
+    (encouraging their limited rank-r capacity to be used non-redundantly, since
+    perturbing these blocks matters most to the task) while every other LoRA
+    block is left as plain (unregularized) LoRA.
+
+    Returns indices sorted in INCREASING order (cosmetic only -- inject_lora
+    doesn't care about order, this just makes printed/logged output deterministic
+    and readable).
+    """
+    excluded = _normalize_indices(excluded_indices)
+    candidates = [(idx, score) for idx, score in saliencies.items() if idx not in excluded]
+    if num_blocks > len(candidates):
+        print(f"[SFP] Warning: requested num_blocks={num_blocks} for orthogonality selection exceeds "
+              f"the number of LoRA-eligible blocks ({len(candidates)}); clamping to {len(candidates)}.")
+        num_blocks = len(candidates)
+    if num_blocks <= 0:
+        return []
+    top = sorted(candidates, key=lambda kv: -kv[1])[:num_blocks]
+    return sorted(idx for idx, _ in top)
+
+
+class PaCALinear(nn.Module):
+    """
+    PaCA (Partial Connection Adaptation, Woo et al. 2025, arXiv:2503.01905).
+
+    An alternative to LoRA/DoRA for making a linear layer trainable: instead of
+    adding a low-rank adapter path, PaCA fine-tunes only r selected COLUMNS of the
+    existing pretrained weight and freezes the rest. There is NO added adapter --
+    the forward pass is the same single matmul on the (partially updated) weight,
+    so unlike LoRA/DoRA nothing extra is inserted into the compute graph. "rank"
+    here means the number of trainable columns r (the paper's own terminology).
+
+    Weight W is (out_features, in_features). We pick r column indices; those columns
+    become the trainable parameter `paca_weight` (out_features, r), initialized to
+    their pretrained values so the layer equals the pretrained layer EXACTLY at init
+    (P is literally a slice of W). Every other column, and the bias, are frozen
+    buffers. Selection happens once at construction and is then fixed.
+
+    selection:
+      "random"  (default; the paper's choice -- their Section 5 shows random matches
+                importance-based selection): r columns chosen uniformly at random via
+                torch's global RNG, which train_sfp_lora.py seeds, so the choice is
+                reproducible across runs with the same --seed.
+      "weight"  the r columns with the largest L2 norm in the pretrained weight
+                (the paper's weight-based variant from Section 5).
+
+    The trainable parameter is named `paca_weight` so that freeze_non_trainable and
+    the optimizer's adapter param-group can recognize PaCA params by the "paca_"
+    substring, exactly mirroring how they key off "lora_". The frozen full weight is
+    kept as a buffer (so it saves/loads in the state_dict and moves with .to(device));
+    its selected columns are overwritten by paca_weight on each forward.
+
+    Note: this is a functionally faithful reproduction (identical trainable-parameter
+    set and math). The paper's kernel-level implementation also avoids storing full
+    input activations for memory savings; reconstructing W here does not replicate
+    that memory optimization, which is irrelevant to accuracy but means this version
+    does not deliver PaCA's training-memory reduction. See the summary notes.
+    """
+    def __init__(self, base_layer: nn.Linear, rank: int, selection: str = "random"):
+        super().__init__()
+        assert selection in ("random", "weight"), \
+            f"PaCA selection must be 'random' or 'weight', got {selection!r}"
+        out_f, in_f = base_layer.out_features, base_layer.in_features
+        assert 0 < rank <= in_f, (
+            f"PaCA rank (number of trainable columns) must satisfy 0 < rank <= in_features "
+            f"({in_f}) for this layer, got {rank}. On a ViT-B this caps at 768 for the "
+            f"qkv/proj/fc1 projections."
+        )
+        self.in_features, self.out_features, self.rank, self.selection = in_f, out_f, rank, selection
+
+        W = base_layer.weight.detach()
+        dev, dt = W.device, W.dtype
+
+        if selection == "weight":
+            col_norms = W.norm(p=2, dim=0)                      # (in_features,)
+            idx = torch.argsort(col_norms, descending=True)[:rank]
+        else:  # "random"
+            idx = torch.randperm(in_f, device=dev)[:rank]
+        idx = torch.sort(idx).values                            # ascending, for stable indexing/logging
+
+        self.register_buffer("selected_idx", idx.to(dev))
+        # Trainable slice = pretrained values of the selected columns.
+        self.paca_weight = nn.Parameter(W[:, idx].clone().to(device=dev, dtype=dt))
+        # Frozen full weight; its selected columns are overwritten in forward.
+        self.register_buffer("frozen_weight", W.clone())
+        if base_layer.bias is not None:
+            self.register_buffer("paca_bias", base_layer.bias.detach().clone())
+        else:
+            self.paca_bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Rebuild the effective weight: frozen columns from the buffer, r trainable
+        # columns from paca_weight. The scatter-assign is differentiable w.r.t.
+        # paca_weight, so gradients flow only to the selected columns.
+        W = self.frozen_weight.clone()
+        W[:, self.selected_idx] = self.paca_weight
+        return F.linear(x, W, self.paca_bias)
+
+    @torch.no_grad()
+    def resample_columns(self):
+        """
+        RPaCA step: commit the currently-trained columns back into the frozen full
+        weight, then pick a fresh RANDOM set of r columns to train next. This makes
+        the weight accumulate all prior epochs' updates while each epoch fine-tunes a
+        different random slice. Returns the list of trainable params whose optimizer
+        state should be reset (their meaning just changed to new columns). Selection
+        here is always random (that is what RPaCA means); the initial --paca-selection
+        strategy only governs the first epoch's columns.
+        """
+        # Commit this epoch's trained columns into the frozen full weight.
+        self.frozen_weight[:, self.selected_idx] = self.paca_weight.data
+        # Pick a fresh random set of columns.
+        new_idx = torch.sort(torch.randperm(self.in_features, device=self.frozen_weight.device)[:self.rank]).values
+        self.selected_idx.copy_(new_idx)
+        # Load the new columns' current values into the trainable parameter.
+        self.paca_weight.data.copy_(self.frozen_weight[:, new_idx])
+        return [self.paca_weight]
+
+    def extra_repr(self) -> str:
+        return (f"in_features={self.in_features}, out_features={self.out_features}, "
+                f"rank(cols)={self.rank}, selection={self.selection}")
+
+
+class PaCAAdapterLinear(nn.Module):
+    """
+    FUSED method: PaCA/RPaCA column SELECTION combined with a low-rank LoRA/DoRA
+    adapter to TUNE the selected columns, instead of training those columns directly.
+
+    Rationale: direct PaCA trains all out*r entries of the selected r-column
+    sub-weight. Here we instead attach a rank-k adapter that only adapts that
+    sub-weight, cutting trainable params to k*(r+out) [+ out for DoRA's magnitude],
+    which is fewer than out*r whenever k < r*out/(r+out) (i.e. roughly k < r).
+
+    Writing the selected sub-weight as P0 = W[:, idx] (out x r, frozen), the layer is
+        y = W_frozen @ x  +  dP @ x[idx]
+    -- the full frozen projection plus the adapter's correction applied ONLY to the r
+    selected input features. The adapter delta sub-weight dP (out x r) is:
+        lora:  dP = scaling * (B @ A)                              # A:(k,r), B:(out,k)
+        dora:  V  = P0 + scaling*(B@A);  dP = m * V/||V||_row - P0  # m:(out,), row norm
+    B is zero-initialized (and DoRA's m = P0 row norm), so dP = 0 at init and the
+    layer equals the pretrained layer exactly at the start.
+
+    Adapter params are named lora_A / lora_B / lora_magnitude so that
+    freeze_non_trainable, the optimizer's adapter LR group, and the orthogonality
+    regularizer recognize them exactly as for a normal LoRA/DoRA layer. apply_ortho
+    gates the orthogonality penalty per layer (for --num-ortho-blocks). `rank` is the
+    adapter rank k (used by orthogonality_penalty). resample_columns() supports RPaCA.
+    """
+    def __init__(self, base_layer: nn.Linear, paca_rank: int, adapter_rank: int,
+                 adapter_type: str = "dora", alpha: float = 32.0, dropout: float = 0.0,
+                 selection: str = "random", apply_ortho: bool = True):
+        super().__init__()
+        assert adapter_type in ("lora", "dora"), f"fused tuner must be 'lora' or 'dora', got {adapter_type!r}"
+        assert selection in ("random", "weight"), f"selection must be 'random' or 'weight', got {selection!r}"
+        out_f, in_f = base_layer.out_features, base_layer.in_features
+        assert 0 < paca_rank <= in_f, (
+            f"--paca-rank (columns) must satisfy 0 < r <= in_features ({in_f}); got {paca_rank}.")
+        assert 0 < adapter_rank <= min(out_f, paca_rank), (
+            f"--paca-adapter-rank (k) must satisfy 0 < k <= min(out_features, paca_rank) "
+            f"= min({out_f}, {paca_rank}); got {adapter_rank}. The fused adapter only makes sense "
+            f"when its rank is below the number of selected columns.")
+        self.in_features, self.out_features = in_f, out_f
+        self.paca_rank, self.rank = paca_rank, adapter_rank
+        self.adapter_type, self.alpha = adapter_type, alpha
+        self.scaling = alpha / adapter_rank
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+        self.selection, self.apply_ortho = selection, apply_ortho
+
+        W = base_layer.weight.detach()
+        dev, dt = W.device, W.dtype
+        idx = self._select(W, selection, paca_rank)
+        self.register_buffer("selected_idx", idx.to(dev))
+        self.register_buffer("frozen_weight", W.clone())
+        if base_layer.bias is not None:
+            self.register_buffer("paca_bias", base_layer.bias.detach().clone())
+        else:
+            self.paca_bias = None
+
+        self.lora_A = nn.Parameter(torch.zeros(adapter_rank, paca_rank, device=dev, dtype=dt))
+        self.lora_B = nn.Parameter(torch.zeros(out_f, adapter_rank, device=dev, dtype=dt))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        if adapter_type == "dora":
+            with torch.no_grad():
+                row_norm = self.frozen_weight[:, idx].norm(p=2, dim=1)  # (out,)
+            self.lora_magnitude = nn.Parameter(row_norm)
+        else:
+            self.lora_magnitude = None
+
+    @staticmethod
+    def _select(W, selection, r):
+        if selection == "weight":
+            idx = torch.argsort(W.norm(p=2, dim=0), descending=True)[:r]
+        else:
+            idx = torch.randperm(W.shape[1], device=W.device)[:r]
+        return torch.sort(idx).values
+
+    def _delta_subweight(self):
+        """Returns (dP, P0): the adapter's change to the selected sub-weight and the frozen sub-weight."""
+        P0 = self.frozen_weight[:, self.selected_idx]              # (out, r)
+        BA = self.lora_B @ self.lora_A                             # (out, r)
+        if self.adapter_type == "lora":
+            return self.scaling * BA, P0
+        V = P0 + self.scaling * BA
+        row_norm = V.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)  # (out, 1)
+        W_eff = self.lora_magnitude.unsqueeze(1) * V / row_norm
+        return W_eff - P0, P0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = F.linear(x, self.frozen_weight, self.paca_bias)     # full frozen projection
+        xs = self.dropout(x[..., self.selected_idx])               # (..., r) selected inputs
+        dP, _ = self._delta_subweight()
+        return base + F.linear(xs, dP)
+
+    def orthogonality_penalty(self):
+        """Same (k x k) A@A.T / B.T@B orthonormality residuals as LoRALinear; see that method."""
+        if self.rank <= 0:
+            return None
+        eye_r = torch.eye(self.rank, device=self.lora_A.device, dtype=self.lora_A.dtype)
+        A_term = (self.lora_A @ self.lora_A.t() - eye_r) / self.rank
+        B_term = (self.lora_B.t() @ self.lora_B - eye_r) / self.rank
+        return A_term, B_term
+
+    @torch.no_grad()
+    def resample_columns(self):
+        """
+        RPaCA step for the fused layer: commit the adapter's current delta into the
+        frozen weight at the present columns, pick a fresh random column set, and
+        reset the adapter to a no-op (B=0, A~Kaiming, DoRA m = new P0 row norm).
+        Returns the params whose optimizer state should be reset.
+        """
+        dP, _ = self._delta_subweight()
+        self.frozen_weight[:, self.selected_idx] += dP
+        new_idx = torch.sort(torch.randperm(self.in_features, device=self.frozen_weight.device)[:self.paca_rank]).values
+        self.selected_idx.copy_(new_idx)
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+        if self.adapter_type == "dora":
+            self.lora_magnitude.copy_(self.frozen_weight[:, new_idx].norm(p=2, dim=1))
+        return [p for p in (self.lora_A, self.lora_B, self.lora_magnitude) if p is not None]
+
+    def extra_repr(self) -> str:
+        return (f"in={self.in_features}, out={self.out_features}, cols(r)={self.paca_rank}, "
+                f"adapter={self.adapter_type}, adapter_rank(k)={self.rank}, selection={self.selection}")
+
+
+def resample_all_paca(model: nn.Module) -> list:
+    """
+    RPaCA epoch hook: resample the trainable columns of every PaCALinear /
+    PaCAAdapterLinear in the model. Returns the flat list of parameters whose
+    optimizer state should be cleared (their meaning changed to new columns).
+    """
+    reset = []
+    for m in model.modules():
+        if isinstance(m, (PaCALinear, PaCAAdapterLinear)):
+            reset.extend(m.resample_columns())
+    return reset
+
+
+class UniLoRABank(nn.Module):
+    """
+    Holder for Uni-LoRA's single GLOBAL trainable vector theta_d (arXiv 2506.00799).
+    Every Uni adapter layer in the model shares this one vector; the layers only own
+    (frozen) index/normalization buffers that gather their A/B entries out of it. It is
+    attached to the model as `model.unilora_bank`, so its parameter is discovered by
+    model.parameters()/named_parameters() exactly once. The name "unilora_bank.theta_d"
+    contains the "lora_" substring, so freeze_non_trainable unfreezes it and the
+    optimizer's adapter LR group picks it up, with no changes to that machinery.
+    """
+    def __init__(self, d: int, device=None, dtype=None, seed: int = 0):
+        super().__init__()
+        self.theta_d = nn.Parameter(torch.empty(d, device=device, dtype=dtype))
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        # Paper's init: theta_d ~ U(-0.02, 0.02). theta_d MUST be nonzero at init:
+        # if it were 0, both A and B would be 0 and grad(BA) w.r.t. theta_d would
+        # vanish (a saddle), so the vector could never move. Small uniform noise
+        # keeps the initial adapter delta negligible while allowing gradients.
+        with torch.no_grad():
+            self.theta_d.copy_(torch.empty(d).uniform_(-0.02, 0.02, generator=g))
+        # Bookkeeping for reporting (filled in by inject_unilora).
+        self.subspace_dim = d
+        self.full_lora_dim = None
+
+
+class UniLoRAAdapterLinear(nn.Module):
+    """
+    Uni-LoRA / Uni-DoRA adapter (arXiv 2506.00799, "One Vector is All You Need").
+
+    Standard LoRA gives each layer its own trainable A (r x in) and B (out x r).
+    Uni-LoRA instead reconstructs every layer's A and B by gathering entries from ONE
+    globally shared trainable vector theta_d (held in UniLoRABank) through a frozen,
+    random projection: each A/B entry is assigned a uniformly-random index into
+    theta_d, and multiplied by a fixed normalization 1/sqrt(n_k) where n_k is how many
+    times index k is used across ALL layers (global). That normalization makes the
+    implied projection matrix P (theta_D = P theta_d) isometric. Only theta_d trains;
+    the indices and norms are frozen buffers. This is "unilora".
+
+    "unidora" additionally applies DoRA's magnitude/direction split on top of the
+    Uni-reconstructed low-rank update: the direction is W0 + scaling*(B^T A^T) and a
+    per-layer trainable magnitude vector `lora_magnitude` (one entry per output neuron)
+    rescales each row -- exactly the row-norm DoRA convention used by LoRALinear here.
+
+    Following the paper's Algorithm 1, A has shape (in, r) and B has shape (r, out),
+    and the low-rank update is applied as (x @ A) @ B, i.e. the added weight (in
+    out-by-in form) is scaling * (A @ B)^T. Unlike plain LoRA, the update is NOT exactly
+    zero at init (theta_d is small but nonzero), but the perturbation is tiny.
+    """
+    def __init__(self, base_layer: nn.Linear, theta_param: nn.Parameter, d: int,
+                 rank: int, adapter_type: str = "unilora", alpha: float = 32.0,
+                 dropout: float = 0.0, scale_by_alpha: bool = False,
+                 generator: torch.Generator = None):
+        super().__init__()
+        assert adapter_type in ("unilora", "unidora")
+        assert rank > 0, "Uni-LoRA requires --lora-rank > 0 (the low-rank r)."
+        self.base_layer = base_layer
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+
+        self.adapter_type = adapter_type
+        self.rank = rank
+        self.d = d
+        self.alpha = alpha
+        # The paper's Algorithm 1 uses no alpha scaling; keep scaling=1 by default so
+        # theta_d's U(-0.02,0.02) init behaves as intended. scale_by_alpha=True opts
+        # into the usual alpha/r LoRA scaling if desired.
+        self.scaling = (alpha / rank) if scale_by_alpha else 1.0
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+        # NOT registered as a parameter of THIS module (stored inside a tuple so
+        # nn.Module.__setattr__ doesn't re-register it) -- theta_d lives once in the
+        # bank; here we only keep a reference so gradients flow back to that one vector.
+        self._theta_ref = (theta_param,)
+
+        in_f, out_f = base_layer.in_features, base_layer.out_features
+        dev = base_layer.weight.device
+        # Frozen random projection indices into theta_d. A:(in,r), B:(r,out) per Alg. 1.
+        idx_A = torch.randint(0, d, (in_f, rank), generator=generator).to(dev)
+        idx_B = torch.randint(0, d, (rank, out_f), generator=generator).to(dev)
+        self.register_buffer("index_A", idx_A)
+        self.register_buffer("index_B", idx_B)
+        # Normalization buffers; real values are filled in globally by inject_unilora
+        # (they depend on index-occurrence counts across ALL layers). Placeholder ones
+        # are never used for a forward before that assignment happens.
+        self.register_buffer("norm_A", torch.ones(in_f, rank, device=dev))
+        self.register_buffer("norm_B", torch.ones(rank, out_f, device=dev))
+
+        if adapter_type == "unidora":
+            with torch.no_grad():
+                row_norm = base_layer.weight.norm(p=2, dim=1)  # (out,)
+            self.lora_magnitude = nn.Parameter(row_norm)
+        else:
+            self.lora_magnitude = None
+
+    def _reconstruct_AB(self):
+        theta = self._theta_ref[0]
+        A = theta[self.index_A] * self.norm_A   # (in, r)
+        B = theta[self.index_B] * self.norm_B   # (r, out)
+        return A, B
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        A, B = self._reconstruct_AB()
+        if self.adapter_type == "unilora":
+            base = self.base_layer(x)
+            delta = torch.matmul(torch.matmul(self.dropout(x), A), B)  # (..., out)
+            return base + self.scaling * delta
+        # As with standalone DoRA, dropout affects only the low-rank input.
+        W0 = self.base_layer.weight
+        W_delta = self.scaling * torch.matmul(A, B).t()
+        V = W0 + W_delta
+        row_norm = V.norm(p=2, dim=1).clamp(min=1e-8)
+        scale = self.lora_magnitude / row_norm
+        result = F.linear(x, W0) + F.linear(self.dropout(x), W_delta)
+        result = result * scale
+        if self.base_layer.bias is not None:
+            result = result + self.base_layer.bias
+        return result
+
+    def extra_repr(self) -> str:
+        return (f"in={self.base_layer.in_features}, out={self.base_layer.out_features}, "
+                f"rank={self.rank}, d={self.d}, type={self.adapter_type}")
+
+
+def inject_unilora(
+    model: nn.Module,
+    excluded_block_indices,
+    d: int,
+    rank: int = 4,
+    adapter_type: str = "unilora",
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+    seed: int = 0,
+    scale_by_alpha: bool = False,
+) -> int:
+    """
+    Inject Uni-LoRA/Uni-DoRA into every block EXCEPT the filter-substituted ones,
+    hitting the same target linear layers as inject_lora. All injected layers SHARE a
+    single global trainable vector theta_d of length d (held in model.unilora_bank).
+
+    Two passes: (1) build every adapter layer with random projection indices into
+    theta_d; (2) compute the global per-index occurrence counts n_k over all layers'
+    indices and set each layer's 1/sqrt(n_k) normalization (isometric projection).
+
+    Returns the number of trainable adapter parameters: d (theta_d), plus the DoRA
+    magnitude vectors (out_features per layer) when adapter_type="unidora".
+    """
+    assert adapter_type in ("unilora", "unidora")
+    assert d and d > 0, "Uni-LoRA subspace dim d must be positive."
+    excluded = _normalize_indices(excluded_block_indices)
+    ref_device = next(model.parameters()).device
+    ref_dtype = next(model.parameters()).dtype
+
+    # Pre-scan the target linear layers (same block/keyword rule as inject_lora) so we
+    # know D = full LoRA parameter count before allocating the subspace vector.
+    targets = []  # (parent_module, attr_name, module)
+    full_lora_dim = 0
+    for idx, block in enumerate(model.blocks):
+        if idx in excluded:
+            continue
+        for name, module in list(block.named_modules()):
+            if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+                parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
+                parent = block if parent_name == "" else block.get_submodule(parent_name)
+                targets.append((parent, attr_name, module))
+                full_lora_dim += rank * (module.in_features + module.out_features)
+
+    if not targets:
+        raise ValueError("Uni-LoRA/Uni-DoRA requires at least one unreplaced target projection")
+
+    # Uni-LoRA requires d << D. Clamp (with a warning) if the requested subspace is not
+    # smaller than the full LoRA space -- otherwise slots would go unused / it degenerates.
+    if d >= full_lora_dim:
+        print(f"[Uni-LoRA] WARNING: requested subspace d={d} >= full LoRA dim D={full_lora_dim}; "
+              f"clamping d to {full_lora_dim}. Uni-LoRA is designed for d << D -- consider a smaller "
+              f"--unilora-dim.")
+        d = full_lora_dim
+
+    # Global shared vector.
+    bank = UniLoRABank(d, device=ref_device, dtype=ref_dtype, seed=seed)
+    model.unilora_bank = bank  # registers the one theta_d parameter on the model
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)  # for projection indices
+
+    # Pass 1: create layers, all sharing bank.theta_d.
+    uni_layers = []
+    for parent, attr_name, module in targets:
+        layer = UniLoRAAdapterLinear(module, bank.theta_d, d, rank,
+                                     adapter_type=adapter_type, alpha=alpha,
+                                     dropout=dropout, scale_by_alpha=scale_by_alpha,
+                                     generator=gen)
+        setattr(parent, attr_name, layer)
+        uni_layers.append(layer)
+
+    # Pass 2: global 1/sqrt(n_k) normalization (isometry).
+    counts = torch.zeros(d, dtype=torch.long, device=ref_device)
+    for layer in uni_layers:
+        counts += torch.bincount(layer.index_A.flatten(), minlength=d)
+        counts += torch.bincount(layer.index_B.flatten(), minlength=d)
+    inv_sqrt = counts.clamp(min=1).to(torch.float32).rsqrt()  # unused indices clamp to 1 (never gathered)
+    empty = int((counts == 0).sum().item())
+    for layer in uni_layers:
+        with torch.no_grad():
+            layer.norm_A.copy_(inv_sqrt[layer.index_A].to(layer.norm_A.dtype))
+            layer.norm_B.copy_(inv_sqrt[layer.index_B].to(layer.norm_B.dtype))
+
+    bank.full_lora_dim = full_lora_dim
+    bank.num_empty_slots = empty
+    magnitude_params = sum(l.lora_magnitude.numel() for l in uni_layers) if adapter_type == "unidora" else 0
+    return d + magnitude_params
+
+
+def inject_paca(
+    model: nn.Module,
+    excluded_block_indices,
+    rank: int = 16,
+    selection: str = "random",
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+    tuner: str = "direct",
+    adapter_rank: int = 0,
+    adapter_type: str = "dora",
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+    ortho_block_indices=None,
+) -> int:
+    """
+    PaCA/RPaCA injection into every block EXCEPT the filter-substituted ones. `rank`
+    is r, the number of selected columns; `selection` is the column-selection strategy
+    (random re-selection each epoch, i.e. RPaCA, is driven by the training loop, not
+    here). Returns total trainable parameters injected.
+
+    tuner:
+      "direct" (default): PaCALinear -- the r selected columns are trained directly
+        (out*r params/layer). This is the original PaCA/RPaCA.
+      "lora"/"dora": PaCAAdapterLinear -- the fused method, where a rank-`adapter_rank`
+        LoRA/DoRA adapter tunes the selected columns instead (k*(r+out) [+out] params,
+        fewer than out*r). alpha/dropout configure that adapter, and ortho_block_indices
+        restricts the orthogonality penalty to selected blocks (like inject_lora).
+    """
+    excluded = _normalize_indices(excluded_block_indices)
+    ortho_set = _normalize_indices(ortho_block_indices) if ortho_block_indices is not None else None
+    total_params = 0
+    for idx, block in enumerate(model.blocks):
+        if idx in excluded:
+            continue
+        block_applies_ortho = True if ortho_set is None else (idx in ortho_set)
+        for name, module in list(block.named_modules()):
+            if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+                parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
+                parent = block if parent_name == "" else block.get_submodule(parent_name)
+                if tuner == "direct":
+                    layer = PaCALinear(module, rank=rank, selection=selection)
+                    total_params += module.out_features * rank
+                else:
+                    layer = PaCAAdapterLinear(module, paca_rank=rank, adapter_rank=adapter_rank,
+                                               adapter_type=tuner, alpha=alpha, dropout=dropout,
+                                               selection=selection, apply_ortho=block_applies_ortho)
+                    total_params += adapter_rank * (rank + module.out_features)
+                    if tuner == "dora":
+                        total_params += module.out_features  # magnitude vector
+                setattr(parent, attr_name, layer)
+    return total_params
+
+
+def inject_lora(
+    model: nn.Module,
+    excluded_block_indices,
+    lora_rank: int = 16,
+    lora_alpha: float = 32.0,
+    lora_dropout: float = 0.0,
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+    ortho_block_indices=None,
+    adapter_type: str = "lora",
+    init_method: str = "default",
+    loftq_bits: int = 4,
+    loftq_iters: int = 5,
+    paca_selection: str = "random",
+    paca_tuner: str = "direct",
+    paca_rank: int = 0,
+    paca_adapter_rank: int = 0,
+    unilora_dim: int = 0,
+    unilora_seed: int = 0,
+) -> int:
+    """
+    Wraps target linear layers with LoRALinear in every block EXCEPT those in
+    excluded_block_indices (the filter-substituted blocks). Returns total number
+    of adapter parameters injected (LoRA/DoRA low-rank params, plus DoRA's
+    per-layer magnitude vector if adapter_type="dora").
+
+    ortho_block_indices: None (default) -> every injected LoRALinear gets
+    apply_ortho=True (the original, non-selective behavior: the orthogonality
+    regularizer, if enabled via nonzero lambda1/lambda2, applies uniformly to
+    every LoRA layer in the model).
+
+    ortho_block_indices: an iterable of block indices (e.g. from
+    select_top_sensitive_blocks) -> ONLY LoRALinear layers inside those specific
+    blocks get apply_ortho=True; every other LoRA-wrapped block gets
+    apply_ortho=False, i.e. becomes plain (unregularized) LoRA regardless of the
+    lambda values passed to compute_lora_orthogonality_loss. Pass an empty list to
+    make every LoRA layer plain (equivalent to lambda1=lambda2=0, but keeps LoRA
+    itself active).
+
+    adapter_type / init_method / loftq_bits / loftq_iters: see LoRALinear's
+    docstring. Applied identically to every injected layer.
+
+    adapter_type in ("paca", "rpaca"): delegates to inject_paca. paca_rank (falling
+    back to lora_rank if unset) is the number of selected columns r; paca_selection
+    is the column strategy; paca_tuner selects direct training vs a fused LoRA/DoRA
+    adapter of rank paca_adapter_rank. For the fused tuner, lora_alpha/lora_dropout
+    configure the adapter and ortho_block_indices restricts its orthogonality penalty;
+    for the direct tuner, the LoRA-specific arguments do not apply. RPaCA vs PaCA (per-
+    epoch column re-selection) is driven by the training loop, not this function.
+    """
+    if adapter_type in ("paca", "rpaca"):
+        cols = paca_rank if paca_rank > 0 else lora_rank
+        fused = paca_tuner in ("lora", "dora")
+        return inject_paca(model, excluded_block_indices, rank=cols, selection=paca_selection,
+                           target_keywords=target_keywords, tuner=paca_tuner,
+                           adapter_rank=paca_adapter_rank,
+                           adapter_type=(paca_tuner if fused else "dora"),
+                           alpha=lora_alpha, dropout=lora_dropout,
+                           ortho_block_indices=ortho_block_indices)
+
+    if adapter_type in ("unilora", "unidora"):
+        return inject_unilora(model, excluded_block_indices, d=unilora_dim, rank=lora_rank,
+                              adapter_type=adapter_type, alpha=lora_alpha, dropout=lora_dropout,
+                              target_keywords=target_keywords, seed=unilora_seed)
+
+    excluded = _normalize_indices(excluded_block_indices)
+    ortho_blocks = None if ortho_block_indices is None else _normalize_indices(ortho_block_indices)
+    lora_params = 0
+    for idx, block in enumerate(model.blocks):
+        if idx in excluded:
+            continue
+        apply_ortho_here = True if ortho_blocks is None else (idx in ortho_blocks)
+        for name, module in list(block.named_modules()):
+            if any(kw in name for kw in target_keywords) and isinstance(module, nn.Linear):
+                parent_name, attr_name = name.rsplit(".", 1) if "." in name else ("", name)
+                parent = block if parent_name == "" else block.get_submodule(parent_name)
+
+                lora_layer = LoRALinear(module, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout,
+                                         apply_ortho=apply_ortho_here, adapter_type=adapter_type,
+                                         init_method=init_method, loftq_bits=loftq_bits, loftq_iters=loftq_iters)
+                setattr(parent, attr_name, lora_layer)
+                lora_params += lora_rank * (module.in_features + module.out_features)
+                if adapter_type == "dora":
+                    lora_params += module.out_features  # the magnitude vector
+    return lora_params
+
+
+def freeze_non_trainable(model: nn.Module, filter_block_indices) -> int:
+    """
+    Sets requires_grad=True for LoRA params, filter-block params (any block index
+    in filter_block_indices), LayerNorm params, and the classifier head;
+    requires_grad=False for everything else. Returns total LayerNorm param count
+    (for logging). LN unfreezing follows the paper's ablation (Table 4): substitution
+    induces activation-distribution shifts, and retraining LN params is needed to
+    realign feature geometry.
+    """
+    indices = _normalize_indices(filter_block_indices)
+
+    adapter_ids = adapter_parameter_ids(model)
+    ln_params = 0
+    ln_parameter_ids = set()
+    for name, module in model.named_modules():
+        if isinstance(module, nn.LayerNorm):
+            for p in module.parameters():
+                ln_params += p.numel()
+                ln_parameter_ids.add(id(p))
+
+    for name, param in model.named_parameters():
+        if (
+            id(param) in adapter_ids
+            or any(name.startswith(f"blocks.{idx}.") for idx in indices)
+            or "head" in name
+            or id(param) in ln_parameter_ids
+        ):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    return ln_params
+
+
+def apply_single_filter_and_lora(
+    model: nn.Module,
+    pruned_block_idx: int,
+    lora_rank: int = 16,
+    lora_alpha: float = 32.0,
+    lora_dropout: float = 0.0,
+    filter_num_layers: int = 1,
+    filter_dropout: float = 0.0,
+    filter_residual_hidden_dim: int = 0,
+    filter_residual_alpha: float = 1.0,
+    filter_residual_dropout: float = 0.0,
+    target_keywords: list = ["qkv", "proj", "fc1", "fc2"],
+    ortho_block_indices=None,
+    adapter_type: str = "lora",
+    init_method: str = "default",
+    loftq_bits: int = 4,
+    loftq_iters: int = 5,
+    paca_selection: str = "random",
+    paca_tuner: str = "direct",
+    paca_rank: int = 0,
+    paca_adapter_rank: int = 0,
+    unilora_dim: int = 0,
+    unilora_seed: int = 0,
+):
+    """
+    Backward-compatible convenience wrapper for the SINGLE-block case, built on top
+    of substitute_filter_block / inject_lora / freeze_non_trainable. Behavior is
+    unchanged from all previous versions of this function when filter_num_layers=1
+    and filter_residual_hidden_dim=0 (both defaults) -- both are new, letting the
+    filter block use more than one (purely linear) layer and/or a nonlinear
+    zero-init residual branch; see MultiLayerFilterBlock's and FilterResidualMLP's
+    docstrings for details.
+
+    ortho_block_indices: see inject_lora's docstring -- None (default) applies the
+    orthogonality regularizer to every LoRA layer if lambda1/lambda2 are nonzero
+    (unchanged old behavior); pass a specific set of block indices (e.g. from
+    select_top_sensitive_blocks) to restrict it to only those blocks' LoRA layers.
+
+    adapter_type / init_method / loftq_bits / loftq_iters: see LoRALinear's
+    docstring -- adapter_type="lora"/init_method="default" (both defaults)
+    reproduce all prior behavior exactly.
+
+    Does NOT perform the pseudoinverse init itself -- caller still does that
+    afterward via filter_block.init_from_pinv(X_in, X_out), exactly as before.
+
+    For multi-block runs (more than one filter-substituted block), don't use this
+    function -- call substitute_filter_block / inject_lora / freeze_non_trainable
+    directly in a loop instead (see train_sfp_lora.py's main() for the pattern).
+    """
+    filter_block = substitute_filter_block(
+        model, pruned_block_idx, num_layers=filter_num_layers, dropout=filter_dropout,
+        residual_hidden_dim=filter_residual_hidden_dim,
+        residual_alpha=filter_residual_alpha, residual_dropout=filter_residual_dropout,
+    )
+    lora_params = inject_lora(model, pruned_block_idx, lora_rank, lora_alpha, lora_dropout, target_keywords,
+                               ortho_block_indices=ortho_block_indices, adapter_type=adapter_type,
+                               init_method=init_method, loftq_bits=loftq_bits, loftq_iters=loftq_iters,
+                               paca_selection=paca_selection, paca_tuner=paca_tuner,
+                               paca_rank=paca_rank, paca_adapter_rank=paca_adapter_rank,
+                               unilora_dim=unilora_dim, unilora_seed=unilora_seed)
+    ln_params = freeze_non_trainable(model, pruned_block_idx)
+
+    layer_desc = "Single" if filter_num_layers <= 1 else f"{filter_num_layers}-Layer"
+    residual_desc = f" + residual(hidden={filter_residual_hidden_dim})" if filter_residual_hidden_dim > 0 else ""
+    print(f"[SFP-SingleFilter] Substituted block {pruned_block_idx} with {layer_desc} Filter Block{residual_desc}.")
+    if adapter_type in ("unilora", "unidora"):
+        bank = getattr(model, "unilora_bank", None)
+        D = bank.full_lora_dim if bank is not None else None
+        print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} trainable parameters "
+              f"(rank={lora_rank}, shared subspace d={unilora_dim}"
+              + (f", full LoRA dim D={D:,}" if D else "") + ").")
+    elif adapter_type in ("paca", "rpaca"):
+        cols = paca_rank if paca_rank > 0 else lora_rank
+        if paca_tuner in ("lora", "dora"):
+            print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()}+{paca_tuner.upper()} "
+                  f"fused parameters (columns r={cols}, adapter rank k={paca_adapter_rank}, "
+                  f"selection={paca_selection}).")
+        else:
+            print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} parameters "
+                  f"(trainable columns/rank={cols}, selection={paca_selection}).")
+    else:
+        print(f"[SFP-SingleFilter] Injected {lora_params:,} {adapter_type.upper()} parameters "
+              f"(rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}, init={init_method}).")
+    print(f"[SFP-SingleFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
+    return filter_block

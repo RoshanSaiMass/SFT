@@ -177,6 +177,8 @@ def test_long_original_cli_names_fit_real_filesystem_and_remain_distinct(tmp_pat
 
 
 @pytest.mark.parametrize("workflow,expected", [
+    ("snip-compact", "--snip-momentum"),
+    ("evaluate-snip-compact", "--summary"),
     ("original", "--data-dir"),
     ("symbolic", "--symbolic-max-terms"),
     ("correlation", "--min-correlation"),
@@ -188,3 +190,20 @@ def test_backend_help_is_reachable(workflow, expected):
                             capture_output=True,text=True)
     assert result.returncode == 0, result.stderr
     assert expected in result.stdout
+
+
+def test_new_workflow_keeps_top_peft_flags_and_csv_indices(tmp_path):
+    flags = ["--adapter-type", "paca", "--paca-tuner", "dora", "--paca-rank", "32",
+             "--paca-adapter-rank", "16", "--filter-type", "symbolic"]
+    command, _ = run.build_command("snip-compact", flags, tmp_path)
+    assert command[-len(flags):] == flags
+    assert "--mode" not in command
+    assert command[command.index("--output-dir")+1] == str(ROOT/"outputs/snip-compact")
+    folder = tmp_path/"run"; folder.mkdir()
+    (folder/"metrics_summary.json").write_text(json.dumps(dict(method="snip-compact",
+        dataset="pets", seed=18, filter_type="symbolic", pruned_block_idx=[4],
+        replaced_block_idx=4, peft_block_idx=8, best_val_acc=90, final_test_acc=89)))
+    rows = collect(tmp_path, tmp_path/"all.csv")
+    assert rows[0]["workflow"] == "snip-compact"
+    assert rows[0]["block_indices"] == "[4]"
+    assert rows[0]["peft_block_idx"] == 8 and rows[0]["final_test_acc"] == 89

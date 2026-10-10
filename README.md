@@ -1,3 +1,25 @@
+# New experiment: SNIP compact replacement + PEFT in the highest-score block
+
+Branch **`sft-snip-compact`** adds `SFT_SNIP_COMPACT`; previous branch refs and
+all three existing backend folders are preserved.
+
+```bash
+python3 run.py snip-compact --dataset pets --filter-type symbolic \
+  --adapter-type lora --lora-rank 16 --seed 18 --device cuda
+```
+
+The paper's whole-candidate SNIP/EMA search selects the compact replacement
+position. PEFT is then added only to the highest-SNIP surviving block. Dense
+base weights stay frozen; the compact filter, adapters/selected columns, all
+LayerNorms and task classifier train. Uni-LoRA/Uni-DoRA are excluded.
+See [the new workflow README](SFT_SNIP_COMPACT/README.md) for all flags,
+training/search budgets, saved results and paper-alignment limits.
+`collect-all` includes the new runs. `evaluate-snip-compact` evaluates a saved
+checkpoint. Existing integrated A100/B200 launchers accept `snip-compact`.
+Download `downloads/SFT-snip-compact.zip` from this branch, or GitHub's branch ZIP.
+
+---
+
 # Integrated SFT, PEFT, compact filters and block subtraction
 
 Branch `sft-integrated` combines these sources without changing their original
