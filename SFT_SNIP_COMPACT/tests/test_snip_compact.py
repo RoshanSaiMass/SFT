@@ -105,6 +105,17 @@ def test_training_search_scope_and_checkpoint(case, filter_type, tmp_path, monke
                    for value in row.values() if torch.is_tensor(value))
         return state
     monkeypatch.setattr(search, "cpu_optimizer_state", checked_snapshot)
+    original_scoring = search.snip_scores
+    expected_original = original_scoring(original, DataLoader(dataset(), batch_size=16), "cpu")
+    scoring_models = []
+    def checked_scoring(model, loader, device):
+        unchanged_architecture = all(type(b) is type(original.blocks[i])
+                                     for i, b in enumerate(model.blocks))
+        scoring_models.append("original" if unchanged_architecture else "candidate")
+        if unchanged_architecture:
+            assert all(torch.equal(value, saved[name]) for name, value in model.state_dict().items())
+        return original_scoring(model, loader, device)
+    monkeypatch.setattr(search, "snip_scores", checked_scoring)
     args = arguments(case, tmp_path, filter_type)
     path = train.train(args)
     summary = json.loads(path.read_text())
@@ -115,6 +126,11 @@ def test_training_search_scope_and_checkpoint(case, filter_type, tmp_path, monke
     assert selection["optimizer_continuity"] and selection["init_images"] == 64
     assert selection["scoring_images"] == 64
     scores = {int(i): score for i, score in selection["target_scores"]["block_scores"].items()}
+    assert scoring_models == ["original"] + ["candidate"] * 5
+    assert selection["peft_score_source"] == "original_vit_before_replacement_and_training"
+    assert selection["target_scores"]["network_score"] == pytest.approx(expected_original["network_score"], rel=1e-5)
+    for i in scores:
+        assert scores[i] == pytest.approx(expected_original["block_scores"][i], rel=1e-5)
     assert sensitive == search.select_sensitive_block(scores, replaced)
     averages = {}
     alive = [0, 1, 2]
@@ -158,6 +174,26 @@ def test_training_search_scope_and_checkpoint(case, filter_type, tmp_path, monke
     assert result["final_test_acc"] == summary["final_test_acc"]
     assert (path.parent / "snip_block_scores.csv").is_file()
     assert (path.parent / "filter_equations.json").is_file()
+
+
+def test_collision_uses_next_original_score_without_changing_compact_search(tmp_path, monkeypatch):
+    base = tiny()
+    args = arguments(("lora", "direct", "default"), tmp_path)
+    def scores(model, loader, device):
+        compact_index = next((i for i, block in enumerate(model.blocks)
+                              if type(block) is not type(base.blocks[i])), None)
+        if compact_index is None:
+            return dict(network_score=103, block_scores={0: 100, 1: 1, 2: 2}, samples=64)
+        # Candidate scores force replacement at 0. Candidate block rankings
+        # intentionally disagree with the original rankings, and must be ignored.
+        return dict(network_score=100-compact_index, block_scores={0: 0, 1: 1000, 2: 0}, samples=64)
+    monkeypatch.setattr(search, "snip_scores", scores)
+    loader = DataLoader(dataset(), batch_size=32)
+    model, selected = search.select_compact_candidate(base, loader, dataset(), args)
+    assert selected["replaced_block"] == selected["original_highest_block"] == 0
+    assert selected["sensitive_block"] == 2
+    assert selected["peft_target_changed_by_replacement"]
+    assert selected["search_history"][-1]["survived"] == [0]
 
 
 @pytest.mark.parametrize("extra", [["--snip-search-epochs", "1"],

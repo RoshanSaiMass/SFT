@@ -142,6 +142,12 @@ def select_compact_candidate(base, train_loader, calibration_dataset, args):
     scoring = DataLoader(score_data, batch_size=args.snip_batch_size, shuffle=False)
     if len(init_data) != 64:
         raise ValueError("Compact initialization requires 64 training calibration images")
+    # PEFT ranking is measured on the original model, before replacement or
+    # candidate fitting. It is independent of the compact filter's gradients.
+    with seeded_stream(args.seed, train_loader, args.device):
+        base.to(args.device)
+        original_scores = snip_scores(base, scoring, args.device)
+    original_scores["source"] = "original_vit_before_replacement_and_training"
     base = base.cpu()
     states, fit_reports, averages, history, optimizers = {}, {}, {}, [], {}
     for index in range(len(base.blocks)):
@@ -199,10 +205,12 @@ def select_compact_candidate(base, train_loader, calibration_dataset, args):
     with seeded_stream(args.seed, train_loader, args.device):
         model = restore_candidate(base, args, index, states[index])
     model.blocks[index].fit_report = fit_reports[index]
-    final_scores = snip_scores(model, scoring, args.device)
-    sensitive = select_sensitive_block(final_scores["block_scores"], index)
+    original_highest = select_sensitive_block(original_scores["block_scores"], None)
+    sensitive = select_sensitive_block(original_scores["block_scores"], index)
     return model, dict(selection="paper-candidates", replaced_block=index, sensitive_block=sensitive,
-                       target_scores=final_scores, search_history=history,
+                       target_scores=original_scores, search_history=history,
+                       peft_score_source=original_scores["source"], original_highest_block=original_highest,
+                       peft_target_changed_by_replacement=original_highest == index,
                        fit_report=fit_reports[index], search_epochs_applied=len(history),
                        selected_candidate_ema=averages[index], search_complete=True,
                        optimizer_continuity=True, reused_winning_candidate=True,

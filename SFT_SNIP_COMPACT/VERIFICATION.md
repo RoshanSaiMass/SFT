@@ -9,10 +9,10 @@ PyTorch 2.14.1+cpu, timm 1.0.30 and pytest 9.1.1.
 | Original SFT / PEFT | 121 |
 | Existing compact workflow | 222 |
 | Block subtraction | 167 |
-| New folder, including inherited compact tests | 256 |
-| **Total** | **813** |
+| New folder, including inherited compact tests | 257 |
+| **Total** | **814** |
 
-Each suite ran in its own process. The new folder includes 34 new tests; its
+Each suite ran in its own process. The new folder includes 35 new tests; its
 other 222 tests verify the copied supporting implementation. Root tests also
 exercise the new trainer/evaluator help and CSV collection. All tests completed
 with no failures or skips. Source suites executed through
@@ -43,3 +43,16 @@ These are CPU functional checks on synthetic small models. No full ViT-B/16
 training, dataset accuracy, GPU execution or Slurm submission was performed.
 Search hyperparameters not specified in the paper remain explicit defaults;
 compact replacement and highest-block PEFT are experimental extensions.
+
+## Original-model PEFT scoring clarification
+
+The updated new-folder suite passed **257 tests** after separating the two
+rankings. PEFT scores are now measured on the original pretrained ViT with the
+existing dataset classifier, before any replacement or training. Tests compare
+these saved scores with direct original-model gradients and verify that only
+candidate-network scores control compact placement. An adversarial collision
+test makes the original highest block equal the compact position, and confirms
+that the next-highest surviving original block receives PEFT, even when compact
+model block scores would choose a different target. The unchanged other-suite
+results above remain from their preceding runs; they were not rerun for this
+localized update. GPU accuracy is still untested.

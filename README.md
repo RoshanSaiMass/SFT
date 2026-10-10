@@ -9,7 +9,8 @@ python3 run.py snip-compact --dataset pets --filter-type symbolic \
 ```
 
 The paper's whole-candidate SNIP/EMA search selects the compact replacement
-position. PEFT is then added only to the highest-SNIP surviving block. Dense
+position. Original ViT per-block SNIP, measured before replacement or training,
+selects the highest-scoring surviving block for PEFT. Dense
 base weights stay frozen; the compact filter, adapters/selected columns, all
 LayerNorms and task classifier train. Uni-LoRA/Uni-DoRA are excluded.
 See [the new workflow README](SFT_SNIP_COMPACT/README.md) for all flags,

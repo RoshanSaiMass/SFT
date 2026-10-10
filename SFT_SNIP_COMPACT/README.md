@@ -9,7 +9,10 @@ launchers retain their old behavior; they do not run this new experiment.
 
 1. Load the original pretrained ViT and preserve the existing dataset splits,
    augmentations, task classifier and sample budget.
-2. Cache 64 training images for pseudo-inverse initialization. Build one
+2. Cache 64 training images for pseudo-inverse initialization. Before replacing
+   or training anything, score the original ViT with its dataset task classifier
+   on training calibration images. Save these original per-block SNIP scores
+   separately for PEFT selection. Build one
    substituted candidate for each of the 12 possible replacement positions.
    The default replacement is the existing compact symbolic filter; `lowrank`
    and `dense` are also available. It replaces the block's full output directly.
@@ -25,9 +28,11 @@ launchers retain their old behavior; they do not run this new experiment.
    `q = momentum*q + (1-momentum)*network_snip`. Prune the lowest-scoring
    candidates each epoch. Default progression: **12 → 6 → 3 → 2 → 1**.
    Retain optimizer moments and reuse the winning candidate's trained state.
-6. Score blocks in the winning substituted model, before adding adapters.
-   Exclude the replaced position and select the **highest-SNIP surviving
-   original block**. Ties use the lower original index.
+6. Use the saved **original-ViT per-block scores**, not scores from the compact
+   model, to select the highest-scoring surviving block for PEFT. If the original
+   highest-scoring block is replaced, use the next-highest surviving original
+   block and record that collision. The compact position remains unchanged.
+   Ties use the lower original index.
 7. Add PEFT to that one block's QKV, attention projection and two MLP linears.
    Train the compact filter, that block's adapters/selected columns, all
    LayerNorms and the classifier. All other dense pretrained weights stay frozen.
@@ -38,8 +43,9 @@ launchers retain their old behavior; they do not run this new experiment.
 Training calibration → 12 compact-substituted models
                          ↓ equal training + whole-model SNIP + EMA pruning
                        Winning compact position
-                         ↓ per-block SNIP in the winning model
-                       Highest surviving block → PEFT only here
+Original ViT → original per-block SNIP ranking (before any replacement/training)
+                         ↓ exclude the selected compact position
+                       Highest surviving original-score block → PEFT only here
 
 Final model: frozen dense blocks + compact filter + one PEFT block
              all LayerNorms and task classifier also trainable
@@ -87,7 +93,7 @@ one is rejected. At least 64 training images are required. All original 13
 datasets are supported; the default selected training-pool budget is 1,000
 images, not the full dataset. Use `--use-full-dataset` explicitly if intended.
 All compared PEFT runs should use identical dataset, seed, compact and search
-settings. Each invocation performs its own search; matching those settings
+settings. Each invocation performs its own original scoring and candidate search; matching those settings
 makes the search independent of the subsequently selected adapter family.
 
 Direct invocation if all Python files are together in this folder:
@@ -117,7 +123,7 @@ The root CLI writes `outputs/snip-compact/<unique-run>/` containing:
 - `metrics_summary.json`: validation/test accuracy, replacement and PEFT
   indices, configuration, parameter accounting and timing;
 - `snip_search.json`: candidate scores, EMA updates, survivors, search resources,
-  final per-block scores and initialization report;
+  original-ViT per-block scores and initialization report;
 - `snip_block_scores.csv`: per-block scores and replacement/PEFT markers;
 - `best_model.pt`, `history.csv`, training/learning-rate/parameter plots;
 - `filter_equations.json`: trained compact filter equations/representation.

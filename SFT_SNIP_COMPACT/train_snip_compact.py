@@ -208,6 +208,7 @@ def train(args):
         raise RuntimeError("CUDA requested but unavailable; refusing CPU fallback.")
     set_seed(args.seed, deterministic=not args.fast)
     config = vars(args).copy()
+    config["selection_protocol"] = "paper_compact_search_original_vit_peft_v2"
     ident = configuration_id(config)
     label = f"snip_compact_{args.filter_type}_{args.adapter_type}_{args.paca_tuner}_{args.dataset}_seed{args.seed}"
     output = Path(args.output_dir).resolve() / f"{label}_{ident}"
@@ -240,12 +241,15 @@ def _train(args, config, ident, output):
     structure = apply_top_peft(model, args, replaced, sensitive)
     del base
     write_json(output / "snip_search.json", selection)
-    rows = [dict(block=i, score=score, compact_replaced=i == replaced, peft_target=i == sensitive)
+    rows = [dict(block=i, score=score, score_source=selection["peft_score_source"],
+                 compact_replaced=i == replaced, peft_target=i == sensitive)
             for i, score in selection["target_scores"]["block_scores"].items()]
     with (output / "snip_block_scores.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     print(f"[SNIP Compact] Replaced Block(s): [{replaced}]", flush=True)
-    print(f"[SNIP Compact] Highest surviving SNIP block {sensitive}: {args.adapter_type}/{args.paca_tuner} PEFT only", flush=True)
+    print(f"[SNIP Compact] Original-ViT SNIP selected surviving block {sensitive}: {args.adapter_type}/{args.paca_tuner} PEFT only", flush=True)
+    if selection["peft_target_changed_by_replacement"]:
+        print("[SNIP Compact] Original highest-score block was replaced; using the highest-scoring surviving original block.", flush=True)
     optimizer = torch.optim.AdamW(build_optimizer_param_groups(model, args.lr, args.lora_lr),
                                  weight_decay=args.weight_decay)
     epochs = args.max_epochs if args.epochs == -1 else args.epochs
