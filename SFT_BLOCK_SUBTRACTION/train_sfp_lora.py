@@ -1,0 +1,1656 @@
+import argparse
+import csv
+import json
+import os
+import time
+try:
+    import resource  # Unix-only; used for peak CPU RSS. Guarded for portability.
+except ImportError:
+    resource = None
+
+# Must be set BEFORE torch is imported / any CUDA context is created. Without this,
+# cuBLAS matmul kernels (Linear layers, attention, AdamW internals) can still use
+# non-deterministic reduction order even with cudnn.deterministic=True, since that
+# flag only governs cuDNN convolution algorithm selection, not cuBLAS.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import random
+import sys
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision.utils import save_image
+import timm
+
+from data import get_dataloaders, IMAGENET_MEAN, IMAGENET_STD
+from single_filter_lora import (
+    apply_single_filter_and_lora,
+    adapter_parameter_ids,
+    count_parameter_breakdown,
+    substitute_filter_block,
+    inject_lora,
+    freeze_non_trainable,
+    compute_lora_orthogonality_loss,
+    select_top_sensitive_blocks,
+    compute_block_target_param_count,
+    compute_compensated_rank,
+    resample_all_paca,
+)
+from snip_selection import select_block_with_snip, select_blocks_with_snip
+from ablation_selection import select_block_with_ablation
+from run_naming import build_run_folder_name
+from plotting import (
+    ensure_dir,
+    plot_training_curves,
+    plot_snip_saliency,
+    plot_param_breakdown,
+    plot_lr_schedule,
+    save_history_csv,
+    save_metrics_summary,
+)
+
+
+def set_seed(seed: int, deterministic: bool = False) -> None:
+    """
+    Seeds every RNG the pipeline touches (python random, numpy, torch CPU/CUDA),
+    for reproducible data splits, model/LoRA init, and DataLoader shuffle order.
+
+    deterministic=True additionally:
+      - enables full cuDNN determinism (fixed conv algorithm, no autotuning)
+      - calls torch.use_deterministic_algorithms(True), which forces deterministic
+        implementations across ALL of torch (not just cuDNN conv) -- this is what
+        actually pins down cuBLAS matmul / AdamW kernel behavior, which
+        cudnn.deterministic alone does NOT cover
+      - requires CUBLAS_WORKSPACE_CONFIG to have been set before torch was imported
+        (done at the top of this file) for the cuBLAS part to take effect
+      - forces PyTorch's scaled_dot_product_attention (used internally by timm's ViT
+        attention blocks) onto its "math" backend, disabling the flash-attention and
+        memory-efficient-attention fused kernels. Those fused kernels use atomic-add
+        based reductions in their backward pass that are NOT deterministic even under
+        use_deterministic_algorithms(True) -- this was the actual remaining source of
+        run-to-run divergence observed even with the other determinism settings on
+        (visible as tiny ~1e-6 relative differences in SNIP saliency scores between
+        otherwise-identical runs, which then compound over training). The math
+        backend is slower but fully deterministic.
+
+    warn_only=True means any OTHER operation without a deterministic implementation
+    will print a warning and fall back to its normal (possibly non-deterministic)
+    kernel, rather than raising and killing the run. Check the console for such
+    warnings if you still see run-to-run variance with deterministic=True -- they'll
+    name the exact op that's still non-deterministic.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+        # Disable non-deterministic fused attention kernels (flash / mem-efficient),
+        # forcing the deterministic "math" SDPA backend. Guarded with hasattr since
+        # these toggles were added in newer torch versions.
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
+    else:
+        torch.backends.cudnn.benchmark = True
+
+    print(f"[Seed] Global seed set to {seed} (deterministic={deterministic}).")
+
+
+def extract_block_inputs_outputs(model: nn.Module, dataloader: DataLoader, block_idx: int, device: str):
+    """Collect exactly 64 training images for paper Eq. 4 initialization."""
+    model.eval()
+    inputs_list, outputs_list = [], []
+
+    def hook_fn(module, input_tensor, output_tensor):
+        inputs_list.append(input_tensor[0].detach().cpu())
+        outputs_list.append(output_tensor.detach().cpu())
+
+    hook_handle = model.blocks[block_idx].register_forward_hook(hook_fn)
+    collected = 0
+    try:
+        with torch.no_grad():
+            for batch in dataloader:
+                x = batch[0][:64 - collected].to(device)
+                model(x)
+                collected += x.size(0)
+                if collected == 64:
+                    break
+    finally:
+        hook_handle.remove()
+    if collected != 64:
+        raise ValueError(f"SFP initialization requires 64 training images, got {collected}")
+    return torch.cat(inputs_list, dim=0), torch.cat(outputs_list, dim=0)
+
+
+def evaluate(model: nn.Module, dataloader: DataLoader, device: str) -> float:
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = batch[0].to(device), batch[1].to(device)
+            preds = model(x).argmax(dim=-1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+    return (correct / total) * 100.0
+
+
+def evaluate_full(model: nn.Module, dataloader: DataLoader, device: str, criterion: nn.Module):
+    """
+    Like evaluate(), but also returns average loss so we can plot a val-loss curve
+    alongside train loss.
+    """
+    model.eval()
+    correct, total, loss_sum = 0, 0, 0.0
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = batch[0].to(device), batch[1].to(device)
+            out = model(x)
+            loss = criterion(out, y)
+            loss_sum += loss.item() * x.size(0)
+            preds = out.argmax(dim=-1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+    avg_loss = loss_sum / total
+    acc = (correct / total) * 100.0
+    return avg_loss, acc
+
+
+def compute_block_output_metrics(model: nn.Module, dataloader: DataLoader, device: str,
+                                  num_batches: int = 10):
+    """
+    Redundancy probe across every pair of blocks (i, j), computed in a single hooked
+    forward pass and returned as four (n_blocks x n_blocks) matrices:
+
+      "pearson"   : average per-sample Pearson CORRELATION between the two blocks'
+                    flattened outputs (centered, normalized). Range [-1, 1], diag 1.
+                    High = the later block barely changed the representation.
+      "cosine"    : average per-sample COSINE SIMILARITY (uncentered, normalized).
+                    Range [-1, 1], diag 1. Like pearson but keeps the mean/offset.
+      "euclidean" : average per-sample EUCLIDEAN (L2) DISTANCE ||o_i - o_j||_2 between
+                    the flattened outputs. >= 0, diag 0. Magnitude grows with feature
+                    count and activation scale, so read it relatively.
+      "rmse"      : average per-sample ROOT-MEAN-SQUARED-ERROR sqrt(mean((o_i-o_j)^2))
+                    = euclidean / sqrt(F). >= 0, diag 0. A scale-per-element version of
+                    the euclidean distance that's comparable across feature dims.
+
+    Intuition (same for all four): ViT blocks are residual, so if a block barely
+    transforms its input its output stays close to the previous block's -- high
+    similarity / low distance flags a redundant transformation. Residual structure
+    makes neighbors inherently similar, so compare values relatively.
+
+    For each sample we flatten block i's output (tokens x embed_dim) into one vector
+    and block j's into another, compute each metric between those two vectors, and
+    average over every sample seen (up to num_batches batches). Runs under no_grad on
+    model.eval(); hooks every entry of model.blocks, so it is method-agnostic (a
+    substituted filter block is just another entry). Returns a dict of numpy arrays,
+    or None if no samples were seen.
+    """
+    import numpy as np
+    n_blocks = len(model.blocks)
+    captured = {}
+
+    def make_hook(idx):
+        def hook(module, inp, out):
+            captured[idx] = (out[0] if isinstance(out, (tuple, list)) else out).detach()
+        return hook
+
+    hooks = [blk.register_forward_hook(make_hook(i)) for i, blk in enumerate(model.blocks)]
+
+    sums = {k: np.zeros((n_blocks, n_blocks), dtype=np.float64)
+            for k in ("pearson", "cosine", "euclidean", "rmse")}
+    total_samples = 0
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for b, batch in enumerate(dataloader):
+                if b >= num_batches:
+                    break
+                x = batch[0].to(device)
+                captured.clear()
+                _ = model(x)
+                bs = x.size(0)
+                # Per-sample flatten -> (bs, F); precompute centered versions + norms.
+                flats, cents, raw_norms, cen_norms = [], [], [], []
+                F_dim = None
+                for i in range(n_blocks):
+                    f = captured[i].reshape(bs, -1).float()
+                    F_dim = f.shape[1]
+                    fc = f - f.mean(dim=1, keepdim=True)
+                    flats.append(f)
+                    cents.append(fc)
+                    raw_norms.append(torch.sqrt((f * f).sum(dim=1)).clamp_min(1e-12))
+                    cen_norms.append(torch.sqrt((fc * fc).sum(dim=1)).clamp_min(1e-12))
+                sqrtF = float(F_dim) ** 0.5
+                for i in range(n_blocks):
+                    for j in range(i, n_blocks):
+                        pear = ((cents[i] * cents[j]).sum(dim=1) / (cen_norms[i] * cen_norms[j]))
+                        cos = ((flats[i] * flats[j]).sum(dim=1) / (raw_norms[i] * raw_norms[j]))
+                        diff = flats[i] - flats[j]
+                        eucl = torch.sqrt((diff * diff).sum(dim=1).clamp_min(0.0))
+                        rmse = eucl / sqrtF
+                        vals = {"pearson": float(pear.sum().item()),
+                                "cosine": float(cos.sum().item()),
+                                "euclidean": float(eucl.sum().item()),
+                                "rmse": float(rmse.sum().item())}
+                        for k, s in vals.items():
+                            sums[k][i, j] += s
+                            if i != j:
+                                sums[k][j, i] += s
+                total_samples += bs
+    finally:
+        for h in hooks:
+            h.remove()
+        if was_training:
+            model.train()
+
+    if total_samples == 0:
+        return None
+    return {k: (m / total_samples) for k, m in sums.items()}
+
+
+def print_block_metric_matrix(matrix, title: str, value_fmt: str = "{:7.3f}"):
+    """Pretty-print one block-pair metric matrix to the console."""
+    n = matrix.shape[0]
+    cell_w = len(value_fmt.format(0.0))
+    print(f"[SFP] {title}")
+    header = " " * 6 + "".join(f"{'B'+str(j):>{cell_w+1}}" for j in range(n))
+    print(header)
+    for i in range(n):
+        cells = "".join(" " + value_fmt.format(matrix[i, j]) for j in range(n))
+        print(f"  B{i:<3d}{cells}")
+
+
+def save_block_metric_csv(matrix, save_dir: str, filename: str) -> str:
+    """
+    Write one block-pair metric matrix to <filename> in save_dir (rows/cols labeled
+    block_0..block_{n-1}; symmetric).
+    """
+    path = os.path.join(save_dir, filename)
+    n = matrix.shape[0]
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([""] + [f"block_{j}" for j in range(n)])
+        for i in range(n):
+            writer.writerow([f"block_{i}"] + [f"{matrix[i, j]:.6f}" for j in range(n)])
+    return path
+
+
+def denormalize(tensor: torch.Tensor, mean: list, std: list) -> torch.Tensor:
+    """Undoes transforms.Normalize so images can be saved as viewable PNGs."""
+    mean_t = torch.tensor(mean, device=tensor.device).view(1, -1, 1, 1)
+    std_t = torch.tensor(std, device=tensor.device).view(1, -1, 1, 1)
+    return (tensor * std_t + mean_t).clamp(0, 1)
+
+
+def build_misclassified_folder_name(full_finetune: bool, lora_rank: int, adapter_type: str,
+                                     init_method: str, ortho_enabled: bool, seed: int,
+                                     block_selection_method: str = "snip",
+                                     compensate_params: bool = False) -> str:
+    """
+    Builds a clean, config-identifiable folder name for a run's misclassified-image
+    dump, per this project's requested naming scheme:
+
+      full fine-tune            -> folder_fft_seed_<seed>
+      SFT only (no LoRA/DoRA)   -> folder_sft_seed_<seed>
+      SFT + LoRA                -> folder_sft_lora_seed_<seed>
+      SFT + LoRA (orthogonal)   -> folder_sft_lora_orthogonal_seed_<seed>
+      SFT + DoRA                -> folder_sft_dora_seed_<seed>
+      SFT + DoRA (orthogonal)   -> folder_sft_dora_orthogonal_seed_<seed>
+      ... any of the above + LoftQ init gets a "_loftq" suffix inserted right after
+      the adapter type, e.g. folder_sft_dora_loftq_orthogonal_seed_<seed>, so
+      switching --adapter-type or --init-method always produces a visibly
+      different, unambiguous folder name (never silently overwrites a
+      differently-configured run's misclassified images).
+
+      block_selection_method="ablation" appends "_ablation" (e.g.
+      folder_sft_seed_0_ablation), so the SNIP-selected and ablation-selected
+      variants of an otherwise-identical config land in different folders instead
+      of overwriting each other. "snip" (default) adds no suffix, so all prior
+      folder names are unchanged.
+
+      compensate_params=True appends "_paramcomp" (e.g.
+      folder_sft_dora_seed_0_paramcomp), for the same reason -- so the
+      parameter-compensated DoRA config doesn't collide with the plain one.
+
+    This is deliberately independent of run_naming.build_run_folder_name (which
+    encodes EVERY CLI flag passed and gets long/unwieldy) -- this one only encodes
+    the handful of dimensions that actually change WHICH of the paper-comparison
+    configurations a run represents, so it stays short and consistently
+    structured across runs.
+    """
+    if full_finetune:
+        return f"folder_fft_seed_{seed}"
+    if lora_rank <= 0 and adapter_type not in ("paca", "rpaca"):
+        base = f"folder_sft_seed_{seed}"
+        return base + ("_ablation" if block_selection_method == "ablation" else "")
+
+    parts = ["folder", "sft", adapter_type]  # adapter_type: "lora" or "dora"
+    if init_method == "loftq":
+        parts.append("loftq")
+    if ortho_enabled:
+        parts.append("orthogonal")
+    parts += ["seed", str(seed)]
+    name = "_".join(parts)
+    if block_selection_method == "ablation":
+        name += "_ablation"
+    if compensate_params:
+        name += "_paramcomp"
+    return name
+
+
+def evaluate_and_save_misclassified(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: str,
+    criterion: nn.Module,
+    output_dir: str,
+    class_names: list = None,
+    mean: list = None,
+    std: list = None,
+    max_images: int = 200,
+    misclassified_dir_name: str = "misclassified",
+):
+    """
+    Same as evaluate_full (loss + accuracy over dataloader), but additionally saves
+    every misclassified image as a PNG under <output_dir>/<misclassified_dir_name>/,
+    plus a CSV log (misclassified_log.csv) with true/predicted labels and confidence.
+
+    misclassified_dir_name: folder name to use (default "misclassified" for backward
+    compatibility). train_sfp_lora.py's main() passes a config-specific name here
+    (see build_misclassified_folder_name) so each run's wrongly-classified images
+    land in a clearly labeled, config-identifiable folder rather than a generic
+    same-named folder in every run.
+
+    max_images caps how many images get saved (<=0 means unlimited) to avoid dumping
+    thousands of files on large test sets; loss/accuracy are still computed over the
+    FULL dataset regardless of the cap. Mode-agnostic: works identically whether the
+    model came from SFP, SFP+LoRA, or --full-finetune, since it only touches the
+    final test-evaluation step, which is already shared across all three.
+    """
+    mean = mean or IMAGENET_MEAN
+    std = std or IMAGENET_STD
+
+    misclassified_dir = ensure_dir(os.path.join(output_dir, misclassified_dir_name))
+    csv_path = os.path.join(misclassified_dir, "misclassified_log.csv")
+
+    model.eval()
+    correct, total, loss_sum, saved_count, global_idx = 0, 0, 0.0, 0, 0
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "sample_index", "true_label_idx", "true_label_name",
+                          "pred_label_idx", "pred_label_name", "confidence"])
+
+        with torch.no_grad():
+            for batch in dataloader:
+                x, y = batch[0].to(device), batch[1].to(device)
+                out = model(x)
+                loss = criterion(out, y)
+                loss_sum += loss.item() * x.size(0)
+
+                probs = torch.softmax(out, dim=-1)
+                confs, preds = probs.max(dim=-1)
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+
+                mismatches = (preds != y).nonzero(as_tuple=True)[0]
+                if mismatches.numel() > 0:
+                    imgs_denorm = denormalize(x[mismatches].detach(), mean, std).cpu()
+                    for local_i, sample_i in enumerate(mismatches.tolist()):
+                        if max_images > 0 and saved_count >= max_images:
+                            continue
+                        true_idx = int(y[sample_i].item())
+                        pred_idx = int(preds[sample_i].item())
+                        conf = float(confs[sample_i].item())
+                        true_name = str(class_names[true_idx]) if class_names else str(true_idx)
+                        pred_name = str(class_names[pred_idx]) if class_names else str(pred_idx)
+
+                        safe_true = true_name.replace("/", "-").replace(" ", "_")
+                        safe_pred = pred_name.replace("/", "-").replace(" ", "_")
+                        fname = f"idx{global_idx + sample_i:05d}_true-{safe_true}_pred-{safe_pred}_conf{conf:.2f}.png"
+
+                        save_image(imgs_denorm[local_i], os.path.join(misclassified_dir, fname))
+                        writer.writerow([fname, global_idx + sample_i, true_idx, true_name,
+                                          pred_idx, pred_name, f"{conf:.4f}"])
+                        saved_count += 1
+
+                global_idx += y.size(0)
+
+    avg_loss = loss_sum / total
+    acc = (correct / total) * 100.0
+    total_misclassified = total - correct
+    print(f"[SFP] Misclassified images: saved {saved_count} / {total_misclassified} total "
+          f"misclassified on test set -> {misclassified_dir}")
+    if max_images > 0 and total_misclassified > max_images:
+        print(f"[SFP] Note: capped at --max-misclassified-images={max_images}; "
+              f"{total_misclassified - saved_count} additional misclassified samples were not saved.")
+    print(f"[SFP] Misclassified log CSV -> {csv_path}")
+
+    return avg_loss, acc, saved_count, csv_path, misclassified_dir
+
+
+def build_optimizer_param_groups(model: nn.Module, main_lr: float, adapter_lr: float):
+    """Group all adaptation parameters (including DoRA magnitude) exactly once."""
+    ids = adapter_parameter_ids(model)
+    main = [p for p in model.parameters() if p.requires_grad and id(p) not in ids]
+    adapters = [p for p in model.parameters() if p.requires_grad and id(p) in ids]
+    return [{"params": main, "lr": main_lr}, {"params": adapters, "lr": adapter_lr}]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SFP Single Filter + LoRA Fine-Tuning")
+    parser.add_argument("--dataset", type=str, default="pets",
+                         choices=["pets", "svhn", "flowers102", "dtd", "caltech101", "cifar100",
+                                  "fgvc_aircraft", "eurosat", "sun397",
+                                  "pcam", "clevr", "dsprites-loc", "dsprites-ori"])
+    parser.add_argument("--num-samples", type=int, default=1000)
+    parser.add_argument("--use-full-dataset", action="store_true")
+    parser.add_argument("--pruned-block", type=int, default=-1,
+                         help="-1 runs SNIP auto-search. Only valid when --num-filter-blocks 1 "
+                              "(manually specifying a fixed set of multiple blocks isn't supported "
+                              "yet -- use SNIP auto-search via --num-filter-blocks for that).")
+    parser.add_argument("--num-filter-blocks", type=int, default=1,
+                         help="How many blocks (top-N by LOWEST SNIP saliency) to replace with filter "
+                              "blocks. 1 = original single-block SFP behavior. N>1 replaces the N "
+                              "least-salient blocks sequentially (each one's pseudoinverse init is "
+                              "computed AFTER earlier substitutions in the set, so later filter blocks "
+                              "correctly learn from the already-modified preceding representations). "
+                              "LoRA (if --lora-rank > 0) is injected into every block NOT in this set. "
+                              "Caution: the paper's own ablation found 2-block substitution slightly "
+                              "underperforming 1-block on their subtractive-only method -- more filter "
+                              "blocks isn't automatically better, treat this as a real hyperparameter.")
+    parser.add_argument("--filter-block-layers", type=int, default=1,
+                         help="Number of stacked FC layers per filter block (default 1 = paper's "
+                              "original single-layer construction). N>1 uses a generalized "
+                              "pseudoinverse init: N-1 layers start as identity, 1 layer gets the "
+                              "solved pseudoinverse matrix -- so the WHOLE STACK is mathematically "
+                              "identical to the N=1 case at initialization, regardless of depth. NOTE: "
+                              "since layers are purely linear (no activation between them), stacking "
+                              "them does NOT add expressivity beyond a single layer by itself -- this "
+                              "is for experimenting with parameterization/depth, not a capacity boost.")
+    parser.add_argument("--filter-residual-hidden-dim", type=int, default=0,
+                         help="Hidden dim of an OPTIONAL nonlinear zero-init residual branch attached "
+                              "to each filter block: fc2(GELU(fc1(x))), with fc2 zero-initialized so "
+                              "the branch contributes exactly 0 at init (same safe-start trick as "
+                              "LoRA's zero-init B matrix) -- doesn't disturb the pseudoinverse-inherited "
+                              "behavior. 0 (default) = no residual branch (unchanged from all previous "
+                              "versions). This IS a genuine capacity boost (has a real nonlinearity), "
+                              "unlike --filter-block-layers which is linear-only.")
+    parser.add_argument("--filter-residual-alpha", type=float, default=1.0,
+                         help="Scaling for the residual branch's output = alpha / hidden_dim (mirrors "
+                              "LoRA's alpha/rank normalization). Only used when "
+                              "--filter-residual-hidden-dim > 0.")
+    parser.add_argument("--filter-residual-dropout", type=float, default=0.0,
+                         help="Dropout on the residual branch's output. Only used when "
+                              "--filter-residual-hidden-dim > 0.")
+    parser.add_argument("--mode", type=str, default=None,
+                         choices=["sft", "full_finetune", "sft_lora_ortho"],
+                         help="Selects one of the three supported training configurations directly, "
+                              "instead of assembling the equivalent behavior from several lower-level "
+                              "flags. If set, this takes priority and configures the run as follows "
+                              "(any flag below still overrides its corresponding default if you also "
+                              "pass it explicitly):\n"
+                              "  'sft'            -> plain SFT baseline: SNIP block substitution + "
+                              "LayerNorm/head training, LoRA forced OFF (--lora-rank 0). No adapters, "
+                              "no orthogonality regularization.\n"
+                              "  'full_finetune'  -> equivalent to --full-finetune: the entire pretrained "
+                              "backbone + head is unfrozen and trained (no SNIP search, no filter block, "
+                              "no LoRA).\n"
+                              "  'sft_lora_ortho' -> SFT + LoRA adapters injected into every non-filter "
+                              "block, WITH the orthogonal-matrix-approximation regularizer on the LoRA "
+                              "A/B matrices turned on by default (see --lora-ortho-lambda1/2) so the "
+                              "adapter's rank-r update directions stay close to orthonormal instead of "
+                              "collapsing onto redundant directions.\n"
+                              "Leave unset (default) to keep the previous flag-by-flag behavior exactly "
+                              "as before this option existed.")
+    parser.add_argument("--full-finetune", action="store_true",
+                         help="Baseline comparison mode: bypass SNIP search, filter block substitution, "
+                              "and LoRA entirely, and fine-tune the ENTIRE pretrained backbone + head "
+                              "instead (i.e. the paper's 'Full' baseline in Table 1/2). "
+                              "--pruned-block, --num-filter-blocks, --filter-block-layers, "
+                              "--filter-residual-hidden-dim, --lora-rank, --lora-alpha, --lora-dropout "
+                              "are all ignored when this is set. Equivalent to --mode full_finetune.")
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument("--adapter-type", type=str, default="lora",
+                         choices=["lora", "dora", "paca", "rpaca", "unilora", "unidora"],
+                         help="'lora' (default): standard low-rank adapter, W' = W_base + scaling*(B@A), "
+                              "unchanged from all previous versions of this script. "
+                              "'dora' (Weight-Decomposed Low-Rank Adaptation): decomposes each adapted "
+                              "layer's weight into a trainable per-output-neuron MAGNITUDE vector m and a "
+                              "DIRECTION component, W' = m * (W_base + scaling*(B@A)) / ||W_base + "
+                              "scaling*(B@A)||_row, where the row-norm is taken per output neuron (the "
+                              "same convention used elsewhere, e.g. Hugging Face PEFT's DoRA). m is "
+                              "initialized to the base layer's own row norms, so W'=W_base exactly at "
+                              "init, same as standard LoRA's zero-initialized B. DoRA adds "
+                              "out_features extra trainable scalars per adapted layer (negligible next to "
+                              "the rank-r update itself) and empirically tends to more closely track full "
+                              "fine-tuning's update *direction*, at a small extra compute cost per forward "
+                              "pass (an extra norm computation over W_base + scaling*(B@A)). Only affects "
+                              "layers that have rank > 0; has no effect if --lora-rank 0 or "
+                              "--full-finetune.\n"
+                              "'paca' (Partial Connection Adaptation, arXiv:2503.01905): NO adapter is "
+                              "added -- instead, r randomly selected COLUMNS of each target pretrained "
+                              "weight are made trainable and the rest of the weight is frozen. r is taken "
+                              "from --lora-rank (the paper calls it 'rank'), and --paca-selection chooses "
+                              "how the columns are picked. Since PaCA trains a slice of the real backbone "
+                              "weights rather than a low-rank adapter, --lora-alpha, --lora-dropout, "
+                              "--init-method loftq, the orthogonality flags, and --compensate-params do "
+                              "NOT apply and can't be combined with it. On a ViT-B, --lora-rank must be "
+                              "<= 768 (the qkv/proj/fc1 input dim). Slots in wherever LoRA/DoRA would "
+                              "(the non-filter blocks), so it composes with SFP substitution as usual.")
+    parser.add_argument("--paca-selection", type=str, default="random", choices=["random", "weight"],
+                         help="How --adapter-type paca/rpaca picks which columns of each weight to train. "
+                              "'random' (default, the paper's choice -- their Sec.5 shows it matches "
+                              "importance-based selection): uniformly random columns, reproducible via "
+                              "--seed. 'weight': the r columns with the largest L2 norm in the pretrained "
+                              "weight (the paper's weight-based variant). For --adapter-type rpaca this only "
+                              "sets the FIRST epoch's columns; every later epoch re-selects randomly. "
+                              "Ignored unless --adapter-type is paca or rpaca.")
+    parser.add_argument("--paca-tuner", type=str, default="direct", choices=["direct", "lora", "dora"],
+                         help="How the PaCA/RPaCA-selected columns are TUNED. 'direct' (default): train the "
+                              "selected columns themselves (out*r params/layer) -- the original PaCA/RPaCA. "
+                              "'lora'/'dora': the FUSED method -- instead of training the columns directly, "
+                              "attach a rank-(--paca-adapter-rank) LoRA/DoRA adapter that tunes ONLY the "
+                              "selected columns, cutting trainable params to k*(r+out)[+out] < out*r. "
+                              "Orthogonalization (--lora-ortho-lambda1/2, --num-ortho-blocks) applies to "
+                              "the fused adapter's A/B matrices. Ignored unless --adapter-type is paca/rpaca.")
+    parser.add_argument("--paca-rank", type=int, default=-1,
+                         help="Number of columns PaCA/RPaCA selects per layer (the paper's 'rank' r). "
+                              "-1 (default) falls back to --lora-rank, so existing paca commands keep "
+                              "working. On a ViT-B, r <= 768 for qkv/proj/fc1. Ignored unless "
+                              "--adapter-type is paca or rpaca.")
+    parser.add_argument("--paca-adapter-rank", type=int, default=-1,
+                         help="Rank k of the fused LoRA/DoRA adapter that tunes the selected columns "
+                              "(only used when --paca-tuner is lora or dora). Must satisfy 0 < k <= r "
+                              "(fewer than the number of selected columns) for the fusion to reduce params. "
+                              "Required when --paca-tuner != direct.")
+    parser.add_argument("--unilora-dim", type=int, default=72000,
+                         help="Uni-LoRA/Uni-DoRA subspace dimension d (arXiv 2506.00799): the length of the "
+                              "SINGLE global trainable vector that ALL adapter layers share via a frozen, "
+                              "isometric random projection. Only d parameters are trained for the whole "
+                              "backbone (plus per-layer magnitude vectors for unidora). Must be << the full "
+                              "LoRA parameter count D (auto-clamped to D with a warning otherwise). The paper "
+                              "uses d=72000 for ViT-Base (default here). --lora-rank sets the underlying LoRA "
+                              "rank r. Ignored unless --adapter-type is unilora or unidora.")
+    parser.add_argument("--init-method", type=str, default="default", choices=["default", "loftq"],
+                         help="'default' (unchanged): lora_A ~ Kaiming-uniform, lora_B = 0, base layer "
+                              "weight kept at full precision. "
+                              "'loftq' (LoftQ-style init): approximates the LoftQ paper's alternating "
+                              "quantization + SVD initialization -- for each adapted layer, alternates "
+                              "(a) quantizing the current residual (base weight minus the current low-rank "
+                              "approximation) and (b) taking an SVD of what quantization couldn't capture "
+                              "to re-fit lora_A/lora_B -- for --loftq-iters rounds, then FREEZES the "
+                              "quantized weight as the new base_layer weight (replacing the original "
+                              "full-precision one) with lora_A/lora_B initialized to approximate the "
+                              "leftover residual, instead of the near-zero-effective-update default init. "
+                              "The intent (as in the original LoftQ paper) is that later LoRA/DoRA "
+                              "fine-tuning starts from a much better approximation of the original "
+                              "full-precision layer than 'quantize now, adapt later' schemes get by "
+                              "default. CAVEAT: this repo has no bitsandbytes/GPU-quantization-kernel "
+                              "dependency, so --loftq-bits here uses a simple, dependency-free uniform "
+                              "affine (min/max range) quantizer implemented in plain PyTorch, NOT NF4 or "
+                              "any of the more sophisticated codebooks used in production LoftQ/QLoRA "
+                              "implementations -- treat this as a lightweight approximation of the "
+                              "LoftQ paper's initialization IDEA, not a bit-exact reimplementation. Combine "
+                              "with --adapter-type dora to get 'LoftQ-initialized DoRA'.")
+    parser.add_argument("--loftq-bits", type=int, default=4,
+                         help="Bit-width for the simulated quantization used by --init-method loftq "
+                              "(e.g. 4 = 16 representable levels per weight, matching typical NF4/INT4 "
+                              "QLoRA setups in spirit). Only used when --init-method loftq.")
+    parser.add_argument("--loftq-iters", type=int, default=5,
+                         help="Number of alternating quantize/SVD-residual-fit rounds for --init-method "
+                              "loftq (the paper's own experiments found returns diminish quickly past "
+                              "~5 iterations). Only used when --init-method loftq.")
+    parser.add_argument("--lora-dropout", type=float, default=0.0,
+                         help="Dropout applied to LoRA adapter input (0.0 disables it). "
+                              "Useful regularization when training on small subsets (e.g. VTAB-1k-style splits).")
+    parser.add_argument("--filter-dropout", type=float, default=0.0,
+                         help="Dropout applied inside the filter block(s) (SingleFilterBlock / "
+                              "MultiLayerFilterBlock already accept this, but it was never wired up from "
+                              "the CLI before -- it was silently always 0 regardless of this flag not "
+                              "existing). Same role as --lora-dropout: extra regularization for these "
+                              "small n-shot training subsets, at the cost of slightly noisier per-batch "
+                              "gradients. 0.0 (default) keeps prior behavior identical.")
+    parser.add_argument("--lora-ortho-lambda1", type=float, default=0.0,
+                         help="Weight (lambda1) on the ||A @ A.T - I||_F^2 orthogonality penalty applied to "
+                              "every LoRA lora_A matrix. Pushes each adapter's rank rows to be mutually "
+                              "orthonormal, i.e. discourages them from learning linearly-dependent / redundant "
+                              "directions. 0.0 (default) disables it entirely -- identical behavior to before "
+                              "this flag existed.")
+    parser.add_argument("--lora-ortho-lambda2", type=float, default=0.0,
+                         help="Weight (lambda2) on the ||B.T @ B - I||_F^2 orthogonality penalty applied to "
+                              "every LoRA lora_B matrix (columns instead of rows, mirroring lambda1 for A). "
+                              "0.0 (default) disables it.")
+    parser.add_argument("--num-ortho-blocks", type=int, default=0,
+                         help="Restricts the orthogonality regularizer (--lora-ortho-lambda1/2) to only the N "
+                              "LoRA-injected blocks the downstream task is MOST sensitive to, instead of "
+                              "applying it to every LoRA block uniformly. 'Most sensitive' = highest SNIP "
+                              "saliency score among the blocks that keep LoRA (i.e. excluding whichever "
+                              "block(s) were already replaced by a filter block -- those are, by "
+                              "construction, the LEAST sensitive blocks, since filter-block selection picks "
+                              "the lowest-saliency ones). The remaining LoRA blocks (i.e. all LoRA blocks NOT "
+                              "in the top N most-sensitive) get plain, unregularized LoRA -- same LoRA "
+                              "adapters, just with lambda1/lambda2 effectively 0 for them specifically. "
+                              "0 (default) = apply the orthogonality penalty to every LoRA block uniformly "
+                              "(unchanged prior behavior). Only meaningful when --lora-rank > 0 and at least "
+                              "one of --lora-ortho-lambda1/--lora-ortho-lambda2 is nonzero; has no effect "
+                              "otherwise. Requires SNIP saliency scores to be available, i.e. --pruned-block "
+                              "must be left at its default (-1) so the automatic SNIP search actually runs -- "
+                              "see the validation check below for the manual --pruned-block case.")
+    parser.add_argument("--block-correlation", action="store_true",
+                         help="After training, compute pairwise redundancy metrics between the OUTPUT "
+                              "activations of every transformer block (block i vs block j, all "
+                              "combinations): Pearson correlation, cosine similarity, Euclidean distance, "
+                              "and RMSE. High correlation/cosine (or low distance/RMSE) between blocks "
+                              "means the later block barely transformed the representation. Prints one "
+                              "matrix per metric and writes block_output_correlation.csv, "
+                              "block_output_cosine_similarity.csv, block_output_euclidean_distance.csv, "
+                              "and block_output_rmse.csv. Works for every method (SFT, SFT+LoRA, SFT+DoRA, "
+                              "SFT+PaCA, full-finetune) since it just hooks each block's output; a "
+                              "substituted filter block is included as one of the blocks. Each metric is "
+                              "averaged over samples of its per-sample value between the two blocks' "
+                              "flattened outputs, measured on the val set.")
+    parser.add_argument("--block-correlation-batches", type=int, default=10,
+                         help="Number of val-set batches to use for --block-correlation (default 10). More "
+                              "batches = a steadier estimate at higher cost. Ignored unless "
+                              "--block-correlation is set.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="LR for filter block, LayerNorm, and head")
+
+    parser.add_argument("--block-selection-method", type=str, default="snip", choices=["snip", "ablation"],
+                         help="How to choose which block(s) get replaced by the filter block. "
+                              "'snip' (default, unchanged): gradient-based SNIP saliency proxy, computed "
+                              "once via a single forward+backward pass -- cheap, but only an approximation "
+                              "of true importance. "
+                              "'ablation': DIRECTLY measures each block's actual contribution by "
+                              "temporarily bypassing it (identity skip) and re-running --ablation-num-batches "
+                              "calibration batches, for every block in turn (see ablation_selection.py). "
+                              "More faithful (it measures real effect, not a proxy) but more expensive "
+                              "(num_blocks + 1 forward passes over --ablation-num-batches batches, vs SNIP's "
+                              "single forward+backward). When 'ablation' is used AND the block is being "
+                              "auto-selected (--pruned-block left at -1), this ALSO runs the SNIP search "
+                              "purely for comparison and writes both results -- which block SNIP would have "
+                              "picked vs which block ablation picks, and whether they agree -- to "
+                              "<output_dir>/block_selection_comparison.json. Only supported for the "
+                              "single-block case (--num-filter-blocks 1, the default); combining with "
+                              "--num-filter-blocks > 1 is not currently implemented and will error out.")
+    parser.add_argument("--ablation-num-batches", type=int, default=6,
+                         help="Number of calibration batches used by --block-selection-method ablation, "
+                              "both for the baseline (no block removed) measurement and for each "
+                              "per-block ablation measurement. Default 6 (a small, cheap calibration "
+                              "sample -- the original version of this method). Pass 0 (or any value <= 0) "
+                              "to instead use the ENTIRE training set for every measurement -- i.e. "
+                              "num_blocks+1 full passes over all your downstream data, no batch cap. Same "
+                              "identity-bypass methodology either way; this only controls how much data "
+                              "each measurement averages over (more data = less noisy baseline/per-block "
+                              "estimates, at proportionally higher compute cost). Only used when "
+                              "--block-selection-method ablation.")
+    parser.add_argument("--compensate-params", action="store_true",
+                         help="Increases --lora-rank (for whichever adapter --adapter-type selects, LoRA "
+                              "or DoRA) on the remaining (non-filter-block) transformer blocks to "
+                              "approximately compensate for the trainable-parameter budget lost by "
+                              "replacing a block with the (typically much smaller) filter block -- i.e. "
+                              "'the parameters we removed by substituting a block get added back as extra "
+                              "adapter capacity on the other blocks', rather than just shrinking the "
+                              "model's total effective capacity. The compensated rank is solved so the "
+                              "EXTRA adapter parameters (relative to the --lora-rank you passed) "
+                              "approximately cover (original block's target-layer param count) minus "
+                              "(filter block's own param count); see compute_compensated_rank in "
+                              "single_filter_lora.py for the exact arithmetic. The resolved rank is logged "
+                              "and recorded in metrics_summary.json as lora_rank_effective (vs "
+                              "lora_rank_base = what you passed via --lora-rank). Requires --lora-rank > 0 "
+                              "and is incompatible with --full-finetune (there's no filter-block "
+                              "replacement, hence no deficit to compensate for, in that mode).")
+
+    parser.add_argument("--lora-lr", type=float, default=3e-4, help="LR for LoRA adapter params (A/B matrices)")
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--label-smoothing", type=float, default=0.1,
+                         help="Label smoothing for the cross-entropy loss (0.0 disables it). Softens "
+                              "the training targets so the model isn't pushed to output extreme "
+                              "(near-1.0) confidence on a training set this small, which is one of the "
+                              "more direct causes of overfitting in low-data fine-tuning. Was previously "
+                              "hardcoded to 0.0 (i.e. off) with no way to change it; default is now 0.1, "
+                              "a standard mild value. Pass --label-smoothing 0.0 to restore old behavior.")
+    parser.add_argument("--epochs", type=int, default=-1,
+                         help="Number of training epochs. Set to -1 to enable early stopping "
+                              "instead of a fixed epoch count (applies identically to all three "
+                              "modes: --full-finetune, SFT-only, SFT+LoRA) -- training then runs "
+                              "up to --max-epochs, stopping early if val accuracy hasn't improved "
+                              "for --patience consecutive epochs.")
+    parser.add_argument("--patience", type=int, default=10,
+                         help="Early stopping patience (epochs without val-acc improvement before "
+                              "stopping). Only used when --epochs -1.")
+    parser.add_argument("--max-epochs", type=int, default=200,
+                         help="Safety ceiling on total epochs when --epochs -1 (early stopping "
+                              "mode). Also used as the cosine LR schedule's horizon in that mode, "
+                              "since the actual stopping epoch isn't known in advance. Ignored "
+                              "when --epochs is set to a positive value.")
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                         help="Linear LR warmup epochs before cosine decay begins. 0 disables warmup.")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0,
+                         help="Cosine decay floor as a fraction of each group's peak LR (e.g. 0.01 = decay to 1%% of peak).")
+    parser.add_argument("--grad-clip", type=float, default=0.0,
+                         help="Max gradient norm for clipping (0.0 disables clipping). Cheap safety net "
+                              "against LR spikes destabilizing training, especially in --full-finetune mode.")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=42, help="Global RNG seed (data splits, model init, "
+                                                               "LoRA init, DataLoader shuffle order).")
+    parser.add_argument("--fast", action="store_true",
+                         help="Disable full determinism for faster training (enables cuDNN autotuning "
+                              "and allows non-deterministic algorithms). Reproducibility is ON by default "
+                              "(RNG seeding + cuDNN determinism + torch.use_deterministic_algorithms); "
+                              "pass --fast only if you don't need bit-exact reproducibility and want speed.")
+    parser.add_argument("--output-dir", type=str, default="./outputs",
+                         help="Root directory for plots, CSV history, and metrics summary. "
+                              "A per-dataset subfolder is created automatically.")
+    parser.add_argument("--save-misclassified-images", type=lambda s: s.lower() not in ("0", "false", "no"),
+                         nargs="?", const=True, default=True,
+                         help="Save every misclassified test-set image (denormalized PNG) into a clean, "
+                              "config-labeled folder directly under --output-dir (e.g. "
+                              "folder_sft_lora_orthogonal_seed_0/), plus a CSV log of true/predicted "
+                              "labels and confidence. ON by default (was opt-in before); pass "
+                              "--save-misclassified-images false to disable. Works identically for SFT, "
+                              "SFT+LoRA/DoRA (+ orthogonal, + LoftQ init), and --full-finetune -- see "
+                              "build_misclassified_folder_name for the exact naming rule per config.")
+    parser.add_argument("--max-misclassified-images", type=int, default=-1,
+                         help="Cap on how many misclassified images to save to disk (<=0 = unlimited). "
+                              "Test accuracy/loss are still computed over the full test set regardless. "
+                              "Default is unlimited so misclassified_log.csv is always complete -- capping "
+                              "would make comparisons across runs ambiguous (can't tell 'correct' apart "
+                              "from 'wrong but not logged').")
+    args = parser.parse_args()
+
+    # --mode is a thin, explicit selector over the three configurations the rest of
+    # this script already supports individually (--full-finetune, plain SNIP+filter-
+    # block SFT with LoRA off, and SNIP+filter-block SFT with LoRA + orthogonality
+    # regularization on). It only fills in values the user didn't already set
+    # explicitly, so combining --mode with a manually-specified flag (e.g.
+    # --mode sft_lora_ortho --lora-rank 8) still respects the manual value.
+    if args.mode is not None:
+        lora_rank_passed = any(tok == "--lora-rank" or tok.startswith("--lora-rank=") for tok in sys.argv[1:])
+        lambda1_passed = any(tok == "--lora-ortho-lambda1" or tok.startswith("--lora-ortho-lambda1=") for tok in sys.argv[1:])
+        lambda2_passed = any(tok == "--lora-ortho-lambda2" or tok.startswith("--lora-ortho-lambda2=") for tok in sys.argv[1:])
+
+        if args.mode == "full_finetune":
+            args.full_finetune = True
+
+        elif args.mode == "sft":
+            if args.adapter_type in ("paca", "rpaca", "unilora", "unidora"):
+                parser.error("--mode sft disables adapters; omit --mode to use that adapter family.")
+            args.full_finetune = False
+            if lora_rank_passed and args.lora_rank != 0:
+                parser.error("--mode sft trains the filter block + LayerNorm/head only (no LoRA "
+                              "adapters); it isn't compatible with an explicit --lora-rank > 0. "
+                              "Either drop --lora-rank, set --lora-rank 0, or use "
+                              "--mode sft_lora_ortho instead.")
+            args.lora_rank = 0
+            args.lora_ortho_lambda1 = 0.0
+            args.lora_ortho_lambda2 = 0.0
+
+        elif args.mode == "sft_lora_ortho":
+            args.full_finetune = False
+            if not lora_rank_passed:
+                args.lora_rank = args.lora_rank if args.lora_rank > 0 else 16
+            elif args.lora_rank <= 0:
+                parser.error("--mode sft_lora_ortho requires LoRA to be enabled "
+                              "(--lora-rank > 0).")
+            # Turn the orthogonality regularizer on by default for this mode, unless
+            # the user explicitly overrode one or both lambdas themselves.
+            if not lambda1_passed:
+                args.lora_ortho_lambda1 = 1e-4
+            if not lambda2_passed:
+                args.lora_ortho_lambda2 = 1e-4
+
+        print(f"[SFP] --mode {args.mode} resolved to: full_finetune={args.full_finetune}, "
+              f"lora_rank={args.lora_rank}, lora_ortho_lambda1={args.lora_ortho_lambda1}, "
+              f"lora_ortho_lambda2={args.lora_ortho_lambda2}")
+
+
+
+    if args.epochs != -1 and args.epochs <= 0:
+        parser.error("--epochs must be a positive integer, or exactly -1 to enable early stopping.")
+    if args.max_epochs <= 0:
+        parser.error("--max-epochs must be a positive integer.")
+    if args.patience <= 0:
+        parser.error("--patience must be a positive integer.")
+    if args.num_filter_blocks < 1:
+        parser.error("--num-filter-blocks must be >= 1.")
+    if args.block_correlation and args.block_correlation_batches < 1:
+        parser.error("--block-correlation-batches must be >= 1.")
+    if args.filter_block_layers < 1:
+        parser.error("--filter-block-layers must be >= 1.")
+    if args.filter_residual_hidden_dim < 0:
+        parser.error("--filter-residual-hidden-dim must be >= 0 (0 disables the residual branch).")
+    if args.num_filter_blocks > 1 and args.pruned_block != -1:
+        parser.error("--pruned-block (a single manual block index) can't be combined with "
+                      "--num-filter-blocks > 1 (multi-block SNIP auto-selection). Leave "
+                      "--pruned-block at its default (-1) when using --num-filter-blocks > 1.")
+    if args.num_ortho_blocks < 0:
+        parser.error("--num-ortho-blocks must be >= 0 (0 disables selective orthogonality).")
+    if args.num_ortho_blocks > 0 and args.full_finetune:
+        parser.error("--num-ortho-blocks has no effect with --full-finetune (there's no LoRA to restrict "
+                      "the orthogonality penalty to). Drop --num-ortho-blocks or --full-finetune.")
+    if args.num_ortho_blocks > 0 and args.pruned_block != -1:
+        parser.error("--num-ortho-blocks requires SNIP saliency scores, which are only computed when the "
+                      "block(s) to replace are found automatically. --pruned-block was set explicitly "
+                      "(skipping the SNIP search), so there are no saliency scores to rank the remaining "
+                      "LoRA blocks by. Leave --pruned-block at its default (-1) to use --num-ortho-blocks.")
+    if args.block_selection_method == "ablation" and args.num_filter_blocks > 1:
+        parser.error("--block-selection-method ablation is only implemented for the single-block case "
+                      "(--num-filter-blocks 1, the default). Combining it with --num-filter-blocks > 1 "
+                      "is not currently supported.")
+    if args.block_selection_method == "ablation" and args.full_finetune:
+        parser.error("--block-selection-method ablation has no effect with --full-finetune (there's no "
+                      "block being replaced, so nothing to select). Drop one of the two flags.")
+    # No lower-bound check on --ablation-num-batches: 0 or negative is a valid,
+    # intentional value meaning "use the full dataset, no cap" (see
+    # ablation_selection.py). Previously this required >= 1, which blocked that
+    # option entirely.
+    if args.compensate_params and args.full_finetune:
+        parser.error("--compensate-params has no effect with --full-finetune (there's no filter-block "
+                      "replacement, hence no parameter deficit to compensate for). Drop one of the two flags.")
+    if args.compensate_params and args.num_filter_blocks > 1:
+        parser.error("--compensate-params is supported only for one filter block.")
+    if args.compensate_params and args.lora_rank <= 0:
+        parser.error("--compensate-params requires --lora-rank > 0 (it works by increasing the LoRA/DoRA "
+                      "rank on the remaining blocks; with --lora-rank 0 there's no adapter capacity to "
+                      "increase). Set --lora-rank to a positive value, or drop --compensate-params.")
+
+    # --adapter-type paca/rpaca select+train columns of the real backbone weights.
+    # With the DIRECT tuner there are no adapter A/B matrices, so LoRA/DoRA-specific
+    # knobs don't apply; with a FUSED tuner (lora/dora) the adapter DOES exist, so
+    # orthogonalization is allowed there. Reject only the genuinely-incompatible
+    # combinations, explicitly, so a run's config can't be misread.
+    if args.adapter_type in ("paca", "rpaca"):
+        fused = args.paca_tuner in ("lora", "dora")
+        if not fused and (args.lora_ortho_lambda1 != 0.0 or args.lora_ortho_lambda2 != 0.0
+                          or args.num_ortho_blocks > 0):
+            parser.error(f"--adapter-type {args.adapter_type} with --paca-tuner direct trains the selected "
+                          "columns directly (no adapter A/B matrices to orthogonalize), so the "
+                          "orthogonality flags don't apply. Use --paca-tuner lora/dora to enable a fused "
+                          "adapter you can orthogonalize, or drop the orthogonality flags.")
+        if args.init_method == "loftq":
+            parser.error(f"--init-method loftq is a LoRA/DoRA adapter initialization; it doesn't apply to "
+                          f"--adapter-type {args.adapter_type}. Use --init-method default.")
+        if args.compensate_params:
+            parser.error(f"--compensate-params computes a LoRA/DoRA-equivalent rank budget and doesn't "
+                          f"apply to --adapter-type {args.adapter_type}. Drop --compensate-params.")
+        cols = args.paca_rank if args.paca_rank > 0 else args.lora_rank
+        if cols <= 0:
+            parser.error(f"--adapter-type {args.adapter_type} needs a positive column count: set --paca-rank "
+                          "(preferred) or --lora-rank > 0.")
+        if fused:
+            if args.paca_adapter_rank <= 0:
+                parser.error(f"--paca-tuner {args.paca_tuner} (fused) requires --paca-adapter-rank > 0 (the "
+                              "rank k of the adapter that tunes the selected columns).")
+            if args.paca_adapter_rank > cols:
+                parser.error(f"--paca-adapter-rank ({args.paca_adapter_rank}) must be <= the column count r "
+                              f"({cols}) for the fused adapter to reduce parameters below direct PaCA.")
+    else:
+        if args.paca_tuner != "direct":
+            parser.error("--paca-tuner only applies to --adapter-type paca/rpaca.")
+        if args.paca_rank > 0 or args.paca_adapter_rank > 0:
+            parser.error("--paca-rank / --paca-adapter-rank only apply to --adapter-type paca/rpaca.")
+
+    # --adapter-type unilora/unidora reconstruct all layers' LoRA A/B from ONE shared
+    # trainable vector via a frozen isometric random projection (arXiv 2506.00799).
+    # The LoRA-specific fitting/regularization knobs don't apply to that shared vector.
+    if args.adapter_type in ("unilora", "unidora"):
+        if args.lora_rank <= 0:
+            parser.error(f"--adapter-type {args.adapter_type} needs --lora-rank > 0 (the underlying LoRA "
+                          "rank r; the paper uses 4).")
+        if args.unilora_dim <= 0:
+            parser.error("--unilora-dim (the shared subspace size d) must be > 0.")
+        if args.lora_ortho_lambda1 != 0.0 or args.lora_ortho_lambda2 != 0.0 or args.num_ortho_blocks > 0:
+            parser.error(f"--adapter-type {args.adapter_type} reconstructs A/B from a shared vector via a "
+                          "fixed projection, so there are no free A/B matrices to orthogonalize. Drop the "
+                          "orthogonality flags.")
+        if args.init_method == "loftq":
+            parser.error(f"--init-method loftq doesn't apply to --adapter-type {args.adapter_type}. "
+                          "Use --init-method default.")
+        if args.compensate_params:
+            parser.error(f"--compensate-params doesn't apply to --adapter-type {args.adapter_type}.")
+
+    early_stopping_enabled = (args.epochs == -1)
+    effective_epochs = args.max_epochs if early_stopping_enabled else args.epochs
+
+    # PaCA/RPaCA helpers (used by injection, the RPaCA epoch hook, and reporting):
+    is_paca_family = args.adapter_type in ("paca", "rpaca")
+    is_rpaca = args.adapter_type == "rpaca"
+    paca_is_fused = is_paca_family and args.paca_tuner in ("lora", "dora")
+    paca_cols = (args.paca_rank if args.paca_rank > 0 else args.lora_rank) if is_paca_family else 0
+    # Uni-LoRA/Uni-DoRA helper (shared-subspace adapters):
+    is_uni_family = args.adapter_type in ("unilora", "unidora")
+    # Whether the run has A/B adapter matrices the orthogonality penalty can act on
+    # (standalone LoRA/DoRA, or a fused PaCA/RPaCA tuner). Uni's A/B are reconstructed
+    # from a shared vector via a fixed projection, so they are NOT free to orthogonalize.
+    has_ab_adapter = (args.adapter_type in ("lora", "dora") and args.lora_rank > 0) or paca_is_fused
+
+    # The --lr default (1e-3) was tuned for SFP's tiny filter block + LN + head
+    # (~0.6-2.8M params). Applied to the ENTIRE pretrained backbone in --full-finetune
+    # mode, it's aggressive enough to cause a destructive/catastrophic-forgetting step
+    # once warmup ramps up to peak LR (visible as a train-loss spike right as warmup
+    # ends). Auto-lower it for full-finetune runs, but only if the user didn't
+    # explicitly pass --lr themselves.
+    lr_passed_explicitly = any(tok == "--lr" or tok.startswith("--lr=") for tok in sys.argv[1:])
+    if args.full_finetune and not lr_passed_explicitly:
+        old_lr = args.lr
+        args.lr = 1e-4
+        print(f"[SFP] --full-finetune set without an explicit --lr: lowering default LR "
+              f"from {old_lr} to {args.lr} (the {old_lr} default was tuned for the tiny "
+              f"SFP filter block, not full-backbone fine-tuning). Pass --lr explicitly to override.")
+
+    set_seed(args.seed, deterministic=not args.fast)
+
+    run_name = build_run_folder_name(sys.argv[1:])
+    output_dir = ensure_dir(os.path.join(args.output_dir, run_name))
+    print(f"[SFP] Run folder name (from CLI args passed): {run_name}")
+    print(f"[SFP] Outputs (plots, CSV, metrics JSON) will be saved to: {output_dir}")
+
+    # 1. Load Data
+    train_loader, val_loader, test_loader, num_classes, class_names = get_dataloaders(args)
+
+    # 2. Load Pretrained Backbone
+    print(f"[SFP] Loading ViT backbone for {num_classes} output classes...")
+    model = timm.create_model("vit_base_patch16_224.augreg_in21k", pretrained=True, num_classes=num_classes)
+    model.to(args.device)
+
+    # 3. Either: (a) SFP path - SNIP search -> pseudoinverse filter block(s) -> optional LoRA, or
+    #    (b)  Full-finetune baseline - skip all of that, unfreeze the entire model.
+    pruned_block_indices = None   # list of ints once determined (None only for full-finetune)
+    snip_saliencies = None
+    snip_plot_path = None
+    filter_blocks = []
+    block_selection_comparison = None
+    removed_block_original_params = None
+    filter_block_params = None
+    lora_rank_base = args.lora_rank
+    lora_rank_effective = args.lora_rank
+    compensation_info = None
+
+    if args.full_finetune:
+        print("[SFP] --full-finetune set: skipping SNIP search, filter block substitution, "
+              "and LoRA injection. The ENTIRE backbone + head will be trained "
+              "(this is the paper's 'Full' fine-tuning baseline).")
+        for p in model.parameters():
+            p.requires_grad = True
+
+    elif args.num_filter_blocks == 1:
+        # Single-block path: identical behavior/logging to all previous versions
+        # when --block-selection-method snip (the default) and --compensate-params
+        # isn't set.
+        pruned_block_idx = args.pruned_block
+        block_selection_comparison = None  # only populated when method="ablation"
+
+        if pruned_block_idx < 0:
+            if args.block_selection_method == "snip":
+                print("[SFP] No block index provided. Running SNIP search...")
+                pruned_block_idx, snip_saliencies = select_block_with_snip(
+                    model, train_loader, device=args.device, keep="low", return_scores=True
+                )
+                snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_idx, output_dir)
+                print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
+
+            else:  # args.block_selection_method == "ablation"
+                print("[SFP] No block index provided. Running block-ablation search "
+                      f"({args.ablation_num_batches} calibration batch(es) per block)...")
+                ablation_idx, ablation_result = select_block_with_ablation(
+                    model, train_loader, device=args.device, num_batches=args.ablation_num_batches,
+                    keep="low", return_scores=True
+                )
+                # Also run SNIP, purely so we can report which block SNIP would have
+                # picked vs. what ablation picked -- extra compute cost, only paid
+                # when you've explicitly opted into --block-selection-method ablation.
+                print("[SFP] Also running SNIP search for comparison (metadata only -- "
+                      "the block actually used below is the ABLATION result)...")
+                snip_idx, snip_saliencies = select_block_with_snip(
+                    model, train_loader, device=args.device, keep="low", return_scores=True
+                )
+
+                pruned_block_idx = ablation_idx
+                agree = (ablation_idx == snip_idx)
+                print(f"[SFP] SNIP would have selected block {snip_idx}; ablation selected block "
+                      f"{ablation_idx} ({'SAME block' if agree else 'DIFFERENT blocks'}). "
+                      f"Using the ABLATION result: block {pruned_block_idx}.")
+
+                block_selection_comparison = {
+                    "method_used": "ablation",
+                    "snip_selected_block": snip_idx,
+                    "snip_saliencies": {str(k): v for k, v in snip_saliencies.items()},
+                    "ablation_selected_block": ablation_idx,
+                    "ablation_baseline_loss": ablation_result["baseline_loss"],
+                    "ablation_baseline_acc": ablation_result["baseline_acc"],
+                    "ablation_num_calibration_samples": ablation_result["num_calibration_samples"],
+                    "ablation_num_calibration_batches": ablation_result["num_calibration_batches"],
+                    "ablation_per_block": {str(k): v for k, v in ablation_result["per_block"].items()},
+                    "methods_agree": agree,
+                    "final_selected_block": pruned_block_idx,
+                }
+                comparison_path = os.path.join(output_dir, "block_selection_comparison.json")
+                with open(comparison_path, "w") as f:
+                    json.dump(block_selection_comparison, f, indent=2)
+                print(f"[SFP] Saved SNIP-vs-ablation comparison metadata -> {comparison_path}")
+
+                snip_plot_path = plot_snip_saliency(snip_saliencies, snip_idx, output_dir)
+                print(f"[SFP] Saved SNIP saliency plot (for the comparison, not necessarily the block "
+                      f"actually used) -> {snip_plot_path}")
+
+        # Parameter count of the block ABOUT TO BE replaced -- must be measured
+        # BEFORE substitute_filter_block runs, since afterward the original Linear
+        # layers are gone. Always computed (cheap, just a parameter count) so it's
+        # available in metrics_summary.json even when --compensate-params isn't used.
+        removed_block_original_params = compute_block_target_param_count(model.blocks[pruned_block_idx])
+
+        print(f"[SFP] Extracting representations for Pseudo-Inverse Init at block {pruned_block_idx}...")
+        X_in, X_out = extract_block_inputs_outputs(model, train_loader, pruned_block_idx, args.device)
+
+        ortho_block_indices = None
+        if args.num_ortho_blocks > 0 and has_ab_adapter:
+            ortho_block_indices = select_top_sensitive_blocks(
+                snip_saliencies, [pruned_block_idx], args.num_ortho_blocks
+            )
+            print(f"[SFP] Restricting orthogonality regularization to the top {args.num_ortho_blocks} "
+                  f"most task-sensitive adapter block(s) (highest SNIP saliency): {ortho_block_indices}. "
+                  f"All other adapter blocks use plain (unregularized) adapters.")
+
+        filter_block = substitute_filter_block(
+            model, pruned_block_idx, num_layers=args.filter_block_layers,
+            dropout=args.filter_dropout,
+            residual_hidden_dim=args.filter_residual_hidden_dim,
+            residual_alpha=args.filter_residual_alpha,
+            residual_dropout=args.filter_residual_dropout,
+        )
+        filter_block.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
+        filter_blocks = [filter_block]
+        pruned_block_indices = [pruned_block_idx]
+
+        filter_block_params = sum(p.numel() for p in filter_block.parameters())
+        param_deficit = max(0, removed_block_original_params - filter_block_params)
+        lora_rank_base = args.lora_rank
+        lora_rank_effective = args.lora_rank
+        compensation_info = None
+
+        if args.compensate_params:
+            comp = compute_compensated_rank(
+                model, pruned_block_indices, base_rank=args.lora_rank, param_deficit=param_deficit
+            )
+            lora_rank_effective = comp["compensated_rank"]
+            compensation_info = {
+                "removed_block_original_params": removed_block_original_params,
+                "filter_block_params": filter_block_params,
+                "param_deficit": param_deficit,
+                "lora_rank_base": lora_rank_base,
+                "lora_rank_effective": lora_rank_effective,
+                "extra_rank": comp["extra_rank"],
+                "cost_per_rank_unit": comp["cost_per_rank_unit"],
+            }
+            print(f"[SFP] --compensate-params: block {pruned_block_idx}'s original target-layer params "
+                  f"({removed_block_original_params:,}) minus the filter block's own params "
+                  f"({filter_block_params:,}) = deficit of {param_deficit:,}. Compensating by raising "
+                  f"{args.adapter_type.upper()} rank from {lora_rank_base} to {lora_rank_effective} "
+                  f"(+{comp['extra_rank']} rank) on the remaining {len(model.blocks) - 1} block(s).")
+
+
+        # Inject once at the final rank. Reinjecting LoftQ would quantize an
+        # already-quantized base instead of initializing from original weights.
+        n_adapters = inject_lora(
+            model, pruned_block_indices, lora_rank_effective, args.lora_alpha,
+            args.lora_dropout, ortho_block_indices=ortho_block_indices,
+            adapter_type=args.adapter_type, init_method=args.init_method,
+            loftq_bits=args.loftq_bits, loftq_iters=args.loftq_iters,
+            paca_selection=args.paca_selection, paca_tuner=args.paca_tuner,
+            paca_rank=args.paca_rank, paca_adapter_rank=args.paca_adapter_rank,
+            unilora_dim=args.unilora_dim, unilora_seed=args.seed,
+        )
+        ln_params = freeze_non_trainable(model, pruned_block_indices)
+        print(f"[SFP] Injected {n_adapters:,} adaptation parameters; "
+              f"unfroze {ln_params:,} LayerNorm parameters.")
+
+    else:
+        # Multi-block path (--num-filter-blocks > 1): SNIP auto-selects the N
+        # least-salient blocks, substituted SEQUENTIALLY (increasing index order)
+        # so each later filter block's pseudoinverse init is computed from the
+        # model's already-partially-modified state -- matches the paper's own
+        # sequential dual-layer construction (Fig. 3), just generalized to N.
+        print(f"[SFP] Running SNIP search for {args.num_filter_blocks} filter block(s)...")
+        pruned_block_indices, snip_saliencies = select_blocks_with_snip(
+            model, train_loader, device=args.device, num_blocks=args.num_filter_blocks,
+            keep="low", return_scores=True
+        )
+        snip_plot_path = plot_snip_saliency(snip_saliencies, pruned_block_indices, output_dir)
+        print(f"[SFP] Saved SNIP saliency plot -> {snip_plot_path}")
+
+        for idx in pruned_block_indices:
+            print(f"[SFP] Extracting representations for Pseudo-Inverse Init at block {idx}...")
+            X_in, X_out = extract_block_inputs_outputs(model, train_loader, idx, args.device)
+            fb = substitute_filter_block(
+                model, idx, num_layers=args.filter_block_layers,
+                dropout=args.filter_dropout,
+                residual_hidden_dim=args.filter_residual_hidden_dim,
+                residual_alpha=args.filter_residual_alpha,
+                residual_dropout=args.filter_residual_dropout,
+            )
+            fb.init_from_pinv(X_in.to(args.device), X_out.to(args.device))
+            filter_blocks.append(fb)
+            layer_desc = "Single" if args.filter_block_layers <= 1 else f"{args.filter_block_layers}-Layer"
+            residual_desc = f" + residual(hidden={args.filter_residual_hidden_dim})" if args.filter_residual_hidden_dim > 0 else ""
+            print(f"[SFP-MultiFilter] Substituted block {idx} with {layer_desc} Filter Block{residual_desc}.")
+
+        ortho_block_indices = None
+        if args.num_ortho_blocks > 0 and has_ab_adapter:
+            ortho_block_indices = select_top_sensitive_blocks(
+                snip_saliencies, pruned_block_indices, args.num_ortho_blocks
+            )
+            print(f"[SFP] Restricting orthogonality regularization to the top {args.num_ortho_blocks} "
+                  f"most task-sensitive adapter block(s) (highest SNIP saliency): {ortho_block_indices}. "
+                  f"All other adapter blocks use plain (unregularized) adapters.")
+
+        lora_params = inject_lora(model, pruned_block_indices, args.lora_rank, args.lora_alpha, args.lora_dropout,
+                                   ortho_block_indices=ortho_block_indices, adapter_type=args.adapter_type,
+                                   init_method=args.init_method, loftq_bits=args.loftq_bits,
+                                   loftq_iters=args.loftq_iters, paca_selection=args.paca_selection,
+                                   paca_tuner=args.paca_tuner, paca_rank=args.paca_rank,
+                                   paca_adapter_rank=args.paca_adapter_rank,
+                                   unilora_dim=args.unilora_dim, unilora_seed=args.seed)
+        ln_params = freeze_non_trainable(model, pruned_block_indices)
+        if is_uni_family:
+            bank = getattr(model, "unilora_bank", None)
+            D = bank.full_lora_dim if bank is not None else None
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} trainable "
+                  f"parameters (rank={args.lora_rank}, shared subspace d={args.unilora_dim}"
+                  + (f", full LoRA dim D={D:,}" if D else "")
+                  + f") across all blocks except {pruned_block_indices}.")
+        elif is_paca_family and paca_is_fused:
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()}+"
+                  f"{args.paca_tuner.upper()} fused parameters (columns r={paca_cols}, adapter rank "
+                  f"k={args.paca_adapter_rank}, selection={args.paca_selection}) across all blocks "
+                  f"except {pruned_block_indices}.")
+        elif is_paca_family:
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
+                  f"(trainable columns/rank={paca_cols}, selection={args.paca_selection}) "
+                  f"across all blocks except {pruned_block_indices}.")
+        else:
+            print(f"[SFP-MultiFilter] Injected {lora_params:,} {args.adapter_type.upper()} parameters "
+                  f"(rank={args.lora_rank}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
+                  f"init={args.init_method}) across all blocks except {pruned_block_indices}.")
+        print(f"[SFP-MultiFilter] Unfroze {ln_params:,} LayerNorm parameters across all blocks.")
+
+    # 6. Optimization Loop
+    model.to(args.device)
+
+    # Split trainable params into two groups since the adapter params and the filter
+    # block / LayerNorm / head have very different scales and typically want
+    # different learning rates (adapters are usually tuned lower, e.g. 1e-4 to 3e-4,
+    # while the full-rank filter block and LN/head can tolerate a higher LR).
+    # PaCA's trainable weight columns (named "paca_") are grouped WITH the adapters
+    # and get --lora-lr: they're a slice of the pretrained backbone, so the lower
+    # adapter LR (not the 1e-3 filter LR) is the safe default against forgetting.
+    param_groups = build_optimizer_param_groups(model, args.lr, args.lora_lr)
+    main_params, lora_params = [group["params"] for group in param_groups]
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        weight_decay=args.weight_decay,
+    )
+    n_main = sum(p.numel() for p in main_params)
+    n_lora = sum(p.numel() for p in lora_params)
+    print(f"[SFP] Optimizer groups -> main: {n_main:,} params @ lr={args.lr} | lora: {n_lora:,} params @ lr={args.lora_lr}")
+
+    # Cosine LR schedule, matching the paper's CosineLRScheduler + AdamW protocol.
+    # Each param group decays from its own peak LR down to min_lr_ratio * peak, over
+    # (epochs - warmup_epochs) steps, with an optional linear warmup beforehand.
+    # eta_min is set per-group since main_params and lora_params can have different peak LRs.
+    warmup_epochs = min(args.warmup_epochs, max(effective_epochs - 1, 0))
+    cosine_epochs = max(effective_epochs - warmup_epochs, 1)
+    eta_mins = [args.lr * args.min_lr_ratio, args.lora_lr * args.min_lr_ratio]
+
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cosine_epochs, eta_min=0.0
+    )
+    # CosineAnnealingLR ignores per-group eta_min unless passed as a list in newer torch;
+    # to stay compatible across torch versions, we manually floor the LR after each step instead.
+
+    if warmup_epochs > 0:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs]
+        )
+    else:
+        scheduler = cosine_sched
+
+    print(f"[SFP] LR schedule: {warmup_epochs} warmup epoch(s) -> cosine decay over {cosine_epochs} epoch(s), "
+          f"min_lr_ratio={args.min_lr_ratio}")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    if early_stopping_enabled:
+        print(f"[SFP] Starting training on {args.dataset.upper()} with EARLY STOPPING "
+              f"(patience={args.patience}, max_epochs={effective_epochs})...")
+    else:
+        print(f"[SFP] Starting training for {args.epochs} epochs on {args.dataset.upper()}...")
+    best_val, best_epoch, best_path = float("-inf"), 0, os.path.join(output_dir, f"best_sfp_lora_{args.dataset}.pt")
+    epochs_without_improvement = 0
+
+    history = {"epoch": [], "train_loss": [], "val_loss": [], "val_acc": [], "lr_main": [], "lr_lora": [],
+               "epoch_compute_s": []}
+    ortho_enabled = (args.lora_ortho_lambda1 != 0.0) or (args.lora_ortho_lambda2 != 0.0)
+    if ortho_enabled:
+        history["train_ortho_loss"] = []
+        print(f"[SFP] LoRA orthogonality regularization ENABLED: "
+              f"lambda1={args.lora_ortho_lambda1} (||A@A.T - I||^2), "
+              f"lambda2={args.lora_ortho_lambda2} (||B.T@B - I||^2)")
+
+    # ---- Efficiency instrumentation (training time / memory / throughput) ----
+    # Lets us compare methods (SFT, LoRA, DoRA, PaCA, full-FT) on the same axes the
+    # PaCA paper reports. train-COMPUTE time = just the fwd/bwd/opt batch loop
+    # (excludes validation & checkpointing) so throughput is clean; train-WALL time
+    # is the whole training phase. Peak GPU memory is measured over the entire loop.
+    use_cuda = torch.cuda.is_available() and str(args.device).startswith("cuda")
+    if use_cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    total_train_compute_s = 0.0
+    total_train_samples = 0
+    train_wall_start = time.perf_counter()
+
+    for epoch in range(1, effective_epochs + 1):
+        model.train()
+        # RPaCA: at the start of each epoch after the first, commit the columns
+        # trained last epoch back into the frozen weights and pick a fresh random
+        # set to train this epoch. Reset the optimizer state for the resampled
+        # params since their meaning changed to new columns.
+        if is_rpaca and epoch > 1:
+            reset_params = resample_all_paca(model)
+            for _p in reset_params:
+                optimizer.state.pop(_p, None)
+        running_loss = 0.0
+        running_ortho_loss = 0.0
+        epoch_samples = 0
+        if use_cuda:
+            torch.cuda.synchronize()
+        epoch_compute_start = time.perf_counter()
+        for batch in train_loader:
+            x, y = batch[0].to(args.device), batch[1].to(args.device)
+            optimizer.zero_grad()
+            out = model(x)
+            task_loss = criterion(out, y)
+            # L = general_loss + lambda1 * ||A @ A.T - I||_F^2 + lambda2 * ||B.T @ B - I||_F^2,
+            # summed over every LoRA adapter in the model. See
+            # single_filter_lora.compute_lora_orthogonality_loss / LoRALinear.orthogonality_penalty
+            # for why A@A.T / B.T@B (not A.T@A / B@B.T) are the correct shapes here.
+            # Returns exactly 0.0 (no graph) when both lambdas are 0, so this is a
+            # strict no-op unless the new flags are explicitly passed.
+            ortho_loss = compute_lora_orthogonality_loss(
+                model, args.lora_ortho_lambda1, args.lora_ortho_lambda2
+            )
+            loss = task_loss + ortho_loss
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(f"Non-finite training loss at epoch {epoch}")
+            loss.backward()
+            if args.grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(main_params + lora_params, max_norm=args.grad_clip)
+            optimizer.step()
+            running_loss += task_loss.item() * x.size(0)
+            epoch_samples += x.size(0)
+            if ortho_enabled:
+                running_ortho_loss += ortho_loss.item() * x.size(0)
+
+        # Close the compute timer for this epoch BEFORE validation, so throughput
+        # reflects training only. Synchronize first so async CUDA kernels are counted.
+        if use_cuda:
+            torch.cuda.synchronize()
+        epoch_compute_s = time.perf_counter() - epoch_compute_start
+        total_train_compute_s += epoch_compute_s
+        total_train_samples += epoch_samples
+
+        epoch_loss = running_loss / len(train_loader.dataset)
+        epoch_ortho_loss = running_ortho_loss / len(train_loader.dataset) if ortho_enabled else None
+        val_loss, val_acc = evaluate_full(model, val_loader, args.device, criterion)
+
+        if not np.isfinite(val_loss) or not np.isfinite(val_acc):
+            raise FloatingPointError(f"Non-finite validation metrics at epoch {epoch}")
+
+        # Record current LR *before* stepping the scheduler for this epoch's log line,
+        # then step + apply the manual min-LR floor for next epoch.
+        lr_main_now = optimizer.param_groups[0]["lr"]
+        lr_lora_now = optimizer.param_groups[1]["lr"] if n_lora > 0 else None
+
+        history["epoch"].append(epoch)
+        history["train_loss"].append(epoch_loss)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["lr_main"].append(lr_main_now)
+        history["lr_lora"].append(lr_lora_now)
+        history["epoch_compute_s"].append(epoch_compute_s)
+        if ortho_enabled:
+            history["train_ortho_loss"].append(epoch_ortho_loss)
+
+        if val_acc > best_val:
+            best_val, best_epoch = val_acc, epoch
+            torch.save(model.state_dict(), best_path)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        lr_lora_display = f"{lr_lora_now:.2e}" if lr_lora_now is not None else "n/a"
+        epoch_display = f"{epoch:03d}/{effective_epochs:03d}" + (" (max)" if early_stopping_enabled else "")
+        patience_display = f" | No-improve: {epochs_without_improvement}/{args.patience}" if early_stopping_enabled else ""
+        ortho_display = f" | Ortho Loss: {epoch_ortho_loss:.4f}" if ortho_enabled else ""
+        print(f"[Epoch {epoch_display}] Train Loss: {epoch_loss:.4f}{ortho_display} | "
+              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | Best Val: {best_val:.2f}%"
+              f"{patience_display} | LR(main/lora): {lr_main_now:.2e}/{lr_lora_display}")
+
+        scheduler.step()
+        # Manually floor each group's LR at min_lr_ratio * its own peak, since
+        # CosineAnnealingLR's built-in eta_min doesn't support per-group floors
+        # across all torch versions.
+        for group, peak_lr, eta_min in zip(optimizer.param_groups, [args.lr, args.lora_lr], eta_mins):
+            if group["lr"] < eta_min:
+                group["lr"] = eta_min
+
+        if early_stopping_enabled and epochs_without_improvement >= args.patience:
+            print(f"[SFP] Early stopping triggered: no val-acc improvement for {args.patience} "
+                  f"epoch(s) (best={best_val:.2f}% @ epoch {best_epoch}). Stopping at epoch {epoch}.")
+            break
+
+    # ---- Aggregate efficiency metrics (time / memory / throughput) ----
+    total_train_wall_s = time.perf_counter() - train_wall_start
+    epochs_done = max(1, len(history["epoch"]))
+    avg_epoch_compute_s = total_train_compute_s / epochs_done
+    first_epoch_compute_s = history["epoch_compute_s"][0] if history["epoch_compute_s"] else None
+    # Steady-state excludes epoch 1 (cuDNN autotune, lazy allocation, dataset
+    # warm-up) for a fairer throughput; falls back to the single epoch otherwise.
+    if epochs_done > 1:
+        steady_state_epoch_compute_s = sum(history["epoch_compute_s"][1:]) / (epochs_done - 1)
+    else:
+        steady_state_epoch_compute_s = avg_epoch_compute_s
+    samples_per_epoch = total_train_samples / epochs_done
+    throughput_samples_per_sec = (total_train_samples / total_train_compute_s) if total_train_compute_s > 0 else None
+    steady_state_throughput_samples_per_sec = (
+        samples_per_epoch / steady_state_epoch_compute_s if steady_state_epoch_compute_s > 0 else None
+    )
+
+    peak_gpu_mem_allocated_mb = None
+    peak_gpu_mem_reserved_mb = None
+    if use_cuda:
+        peak_gpu_mem_allocated_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        peak_gpu_mem_reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+    peak_cpu_rss_mb = None
+    if resource is not None:
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is KB on Linux, bytes on macOS.
+        peak_cpu_rss_mb = ru / (1024 ** 2) if sys.platform == "darwin" else ru / 1024
+
+    # Use one logical counting implementation for efficiency and component reports.
+    _counts = count_parameter_breakdown(model, pruned_block_indices)
+    _trainable_params = _counts["trainable_params"]
+    _total_params = _counts["total_params"]
+
+    efficiency = {
+        "device": str(args.device),
+        "batch_size": args.batch_size,
+        "trainable_params": _trainable_params,
+        "total_params": _total_params,
+        "epochs_trained": epochs_done,
+        "train_samples_processed": total_train_samples,
+        "train_compute_seconds": round(total_train_compute_s, 4),
+        "train_wall_seconds": round(total_train_wall_s, 4),
+        "avg_epoch_compute_seconds": round(avg_epoch_compute_s, 4),
+        "first_epoch_compute_seconds": round(first_epoch_compute_s, 4) if first_epoch_compute_s is not None else None,
+        "steady_state_epoch_compute_seconds": round(steady_state_epoch_compute_s, 4),
+        "throughput_samples_per_sec": round(throughput_samples_per_sec, 2) if throughput_samples_per_sec else None,
+        "steady_state_throughput_samples_per_sec": round(steady_state_throughput_samples_per_sec, 2) if steady_state_throughput_samples_per_sec else None,
+        "peak_gpu_mem_allocated_mb": round(peak_gpu_mem_allocated_mb, 1) if peak_gpu_mem_allocated_mb is not None else None,
+        "peak_gpu_mem_reserved_mb": round(peak_gpu_mem_reserved_mb, 1) if peak_gpu_mem_reserved_mb is not None else None,
+        "peak_cpu_rss_mb": round(peak_cpu_rss_mb, 1) if peak_cpu_rss_mb is not None else None,
+    }
+    efficiency["trainable_pct"] = round(
+        100.0 * efficiency["trainable_params"] / efficiency["total_params"], 4
+    ) if efficiency["total_params"] > 0 else None
+
+    # Save curves + raw per-epoch history as soon as training finishes, so they exist
+    # even if something later (checkpoint reload, test eval) fails.
+    curve_paths = plot_training_curves(history, output_dir, dataset_name=args.dataset)
+    lr_plot_path = plot_lr_schedule(history, output_dir, dataset_name=args.dataset)
+    csv_path = save_history_csv(history, output_dir)
+    print(f"[SFP] Saved training curves -> {curve_paths}")
+    print(f"[SFP] Saved LR schedule plot -> {lr_plot_path}")
+    print(f"[SFP] Saved per-epoch history CSV -> {csv_path}")
+
+    # Load best checkpoint and evaluate test set
+    if best_epoch > 0:
+        model.load_state_dict(torch.load(best_path, map_location=args.device, weights_only=True))
+        print(f"[SFP] Restored best model checkpoint (val_acc={best_val:.2f}%, epoch {best_epoch})")
+
+    test_loss, test_acc, misclassified_saved, misclassified_csv, misclassified_dir = (
+        None, None, None, None, None
+    )
+    if args.save_misclassified_images:
+        misclassified_folder_name = build_misclassified_folder_name(
+            full_finetune=args.full_finetune, lora_rank=args.lora_rank, adapter_type=args.adapter_type,
+            init_method=args.init_method, ortho_enabled=ortho_enabled, seed=args.seed,
+            block_selection_method=args.block_selection_method, compensate_params=args.compensate_params,
+        )
+        test_loss, test_acc, misclassified_saved, misclassified_csv, misclassified_dir = (
+            evaluate_and_save_misclassified(
+                model, test_loader, args.device, criterion, output_dir,
+                class_names=class_names, max_images=args.max_misclassified_images,
+                misclassified_dir_name=misclassified_folder_name,
+            )
+        )
+    else:
+        test_loss, test_acc = evaluate_full(model, test_loader, args.device, criterion)
+
+    # Parameter breakdown (filter block / LoRA / LayerNorm / head / frozen backbone)
+    param_breakdown = count_parameter_breakdown(model, pruned_block_indices)
+    param_plot_path = plot_param_breakdown(param_breakdown, output_dir)
+    print(f"[SFP] Saved parameter breakdown plot -> {param_plot_path}")
+
+    # Optional block-output redundancy probe (measured on the restored best model).
+    block_metric_csvs = None
+    if args.block_correlation:
+        print(f"[SFP] Computing block-output metrics (pearson / cosine / euclidean / rmse) over up to "
+              f"{args.block_correlation_batches} val batch(es)...")
+        metrics = compute_block_output_metrics(
+            model, val_loader, args.device, num_batches=args.block_correlation_batches
+        )
+        if metrics is not None:
+            specs = [
+                ("pearson",   "Block-output PEARSON CORRELATION (avg per-sample; high = redundant)",
+                 "{:7.3f}", "block_output_correlation.csv"),
+                ("cosine",    "Block-output COSINE SIMILARITY (avg per-sample; high = redundant)",
+                 "{:7.3f}", "block_output_cosine_similarity.csv"),
+                ("euclidean", "Block-output EUCLIDEAN DISTANCE (avg per-sample; low = redundant)",
+                 "{:9.2f}", "block_output_euclidean_distance.csv"),
+                ("rmse",      "Block-output RMSE (avg per-sample; low = redundant)",
+                 "{:8.4f}", "block_output_rmse.csv"),
+            ]
+            block_metric_csvs = {}
+            for key, title, fmt, fname in specs:
+                print_block_metric_matrix(metrics[key], title, value_fmt=fmt)
+                block_metric_csvs[key] = save_block_metric_csv(metrics[key], output_dir, fname)
+            print(f"[SFP] Saved block-output metric CSVs -> {', '.join(block_metric_csvs.values())}")
+        else:
+            print("[SFP] Block-output metrics skipped: no validation samples available.")
+
+    if args.full_finetune:
+        resolved_mode = "full_finetune"
+    elif is_paca_family and paca_cols > 0:
+        resolved_mode = f"sft_{args.adapter_type}"          # sft_paca / sft_rpaca
+        if paca_is_fused:
+            resolved_mode += f"_{args.paca_tuner}"          # +_lora / +_dora
+            if ortho_enabled:
+                resolved_mode += "_ortho"
+    elif is_uni_family:
+        resolved_mode = f"sft_{args.adapter_type}"          # sft_unilora / sft_unidora
+    elif args.lora_rank > 0:
+        resolved_mode = f"sft_{args.adapter_type}" + ("_ortho" if ortho_enabled else "")
+    else:
+        resolved_mode = "sft"
+
+    paca_reported = (not args.full_finetune) and is_paca_family and paca_cols > 0
+    uni_reported = (not args.full_finetune) and is_uni_family
+    adapter_reported = (not args.full_finetune) and (args.lora_rank > 0 or paca_reported)
+
+    summary = {
+        "dataset": args.dataset,
+        "backbone": "vit_base_patch16_224.augreg_in21k",
+        "num_classes": num_classes,
+        "num_samples": args.num_samples if not args.use_full_dataset else "full",
+        "mode": resolved_mode,
+        "full_finetune": args.full_finetune,
+        "label_smoothing": args.label_smoothing,
+        "filter_dropout": args.filter_dropout if not args.full_finetune else None,
+        "pruned_block_idx": pruned_block_indices,
+        "num_filter_blocks": args.num_filter_blocks,
+        "filter_block_layers": args.filter_block_layers,
+        "filter_residual_hidden_dim": args.filter_residual_hidden_dim,
+        "filter_residual_alpha": args.filter_residual_alpha if args.filter_residual_hidden_dim > 0 else None,
+        "filter_residual_dropout": args.filter_residual_dropout if args.filter_residual_hidden_dim > 0 else None,
+        "lora_rank": lora_rank_effective if not args.full_finetune else None,
+        "lora_rank_base": lora_rank_base if (not args.full_finetune and args.lora_rank > 0) else None,
+        "num_ortho_blocks": args.num_ortho_blocks if (not args.full_finetune and args.lora_rank > 0) else None,
+        "adapter_type": args.adapter_type if adapter_reported else None,
+        "paca_selection": args.paca_selection if paca_reported else None,
+        "paca_tuner": args.paca_tuner if paca_reported else None,
+        "paca_columns": paca_cols if paca_reported else None,
+        "paca_adapter_rank": args.paca_adapter_rank if (paca_reported and paca_is_fused) else None,
+        "unilora_dim": (getattr(model, "unilora_bank").subspace_dim if uni_reported and hasattr(model, "unilora_bank") else None),
+        "unilora_unused_slots": (getattr(model, "unilora_bank").num_empty_slots if uni_reported and hasattr(model, "unilora_bank") else None),
+        "unilora_full_lora_dim": (getattr(model, "unilora_bank").full_lora_dim if uni_reported and hasattr(model, "unilora_bank") else None),
+        "init_method": args.init_method if (not args.full_finetune and args.lora_rank > 0) else None,
+        "loftq_bits": args.loftq_bits if (not args.full_finetune and args.lora_rank > 0
+                                           and args.init_method == "loftq") else None,
+        "loftq_iters": args.loftq_iters if (not args.full_finetune and args.lora_rank > 0
+                                             and args.init_method == "loftq") else None,
+        "block_selection_method": args.block_selection_method if not args.full_finetune else None,
+        "removed_block_original_params": removed_block_original_params,
+        "filter_block_params": filter_block_params,
+        "compensate_params": args.compensate_params,
+        "compensation_info": compensation_info,
+        "block_selection_comparison_available": block_selection_comparison is not None,
+        "lora_alpha": args.lora_alpha if not args.full_finetune else None,
+        "lora_dropout": args.lora_dropout if not args.full_finetune else None,
+        "lora_ortho_lambda1": args.lora_ortho_lambda1 if ortho_enabled else None,
+        "lora_ortho_lambda2": args.lora_ortho_lambda2 if ortho_enabled else None,
+        "seed": args.seed,
+        "deterministic": not args.fast,
+        "lr_main": args.lr,
+        "lr_lora": args.lora_lr,
+        "warmup_epochs": warmup_epochs,
+        "min_lr_ratio": args.min_lr_ratio,
+        "weight_decay": args.weight_decay,
+        "epochs": args.epochs,
+        "early_stopping_enabled": early_stopping_enabled,
+        "patience": args.patience if early_stopping_enabled else None,
+        "max_epochs": effective_epochs if early_stopping_enabled else None,
+        "epochs_trained": len(history["epoch"]),
+        "batch_size": args.batch_size,
+        "best_val_acc": best_val,
+        "best_epoch": best_epoch,
+        "final_test_acc": test_acc,
+        "final_test_loss": test_loss,
+        "efficiency": efficiency,
+        "block_metric_csvs": block_metric_csvs,
+        "param_breakdown": param_breakdown,
+        "plots": {
+            **curve_paths,
+            "lr_schedule": lr_plot_path,
+            "snip_saliency": snip_plot_path,
+            "param_breakdown": param_plot_path,
+        },
+        "history_csv": csv_path,
+        "checkpoint_path": best_path,
+        "misclassified_images": {
+            "enabled": args.save_misclassified_images,
+            "saved_count": misclassified_saved,
+            "max_images_cap": args.max_misclassified_images if args.save_misclassified_images else None,
+            "csv": misclassified_csv,
+            "dir": misclassified_dir,
+        },
+    }
+    summary_path = save_metrics_summary(summary, output_dir)
+
+    print(f"\n==================================================")
+    print(f"[SFP] Dataset: {args.dataset.upper()}")
+    if args.full_finetune:
+        print(f"[SFP] Mode: FULL FINE-TUNE (baseline, no SFP/LoRA)")
+    else:
+        layer_desc = "Single" if args.filter_block_layers <= 1 else f"{args.filter_block_layers}-Layer"
+        if paca_reported and paca_is_fused:
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()}+{args.paca_tuner.upper()}"
+                  f"{' (orthogonal)' if ortho_enabled else ''} | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
+                  f"columns r={paca_cols}, adapter rank k={args.paca_adapter_rank}, selection={args.paca_selection}")
+        elif paca_reported:
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()} | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
+                  f"trainable columns/rank={paca_cols}, selection={args.paca_selection}")
+        elif uni_reported:
+            _bank = getattr(model, "unilora_bank", None)
+            _D = _bank.full_lora_dim if _bank is not None else None
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()} | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
+                  f"rank={args.lora_rank}, shared subspace d={args.unilora_dim}"
+                  + (f" (full LoRA dim D={_D:,})" if _D else ""))
+        elif args.lora_rank > 0:
+            ortho_desc = (f" | Orthogonal reg: lambda1={args.lora_ortho_lambda1}, "
+                           f"lambda2={args.lora_ortho_lambda2}") if ortho_enabled else ""
+            rank_desc = (f"{lora_rank_effective} (base {lora_rank_base}, compensated)"
+                         if lora_rank_effective != lora_rank_base else f"{lora_rank_effective}")
+            print(f"[SFP] Mode: SFT+{args.adapter_type.upper()}{' (orthogonal)' if ortho_enabled else ''} | "
+                  f"Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} ({layer_desc} Filter Block) | "
+                  f"rank={rank_desc}, alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
+                  f"init={args.init_method}{ortho_desc}")
+        else:
+            print(f"[SFP] Mode: SFT-only (no LoRA) | Block selection: {args.block_selection_method} | "
+                  f"Replaced Block(s): {pruned_block_indices} "
+                  f"({layer_desc} Filter Block) | filter_dropout={args.filter_dropout}")
+    print(f"[SFP] Trainable Params: {param_breakdown['trainable_params']:,} / "
+          f"{param_breakdown['total_params']:,} ({param_breakdown['trainable_pct']:.2f}%)")
+    print(f"[SFP]   - Filter block      : {param_breakdown['filter_block']:,}")
+    print(f"[SFP]   - LoRA adapters     : {param_breakdown['lora']:,}")
+    print(f"[SFP]   - LayerNorm         : {param_breakdown['layernorm']:,}")
+    print(f"[SFP]   - Head              : {param_breakdown['head']:,}")
+    print(f"[SFP]   - Trainable backbone: {param_breakdown['trainable_backbone']:,}")
+    print(f"[SFP] Best Val Acc: {best_val:.2f}% (epoch {best_epoch})")
+    print(f"[SFP] Final Test Acc: {test_acc:.2f}% | Final Test Loss: {test_loss:.4f}")
+    gpu_mem_disp = (f"{efficiency['peak_gpu_mem_reserved_mb']:.0f} MB reserved "
+                    f"({efficiency['peak_gpu_mem_allocated_mb']:.0f} MB allocated)"
+                    if efficiency['peak_gpu_mem_reserved_mb'] is not None else "n/a (CPU)")
+    tput_disp = (f"{efficiency['steady_state_throughput_samples_per_sec']:.1f}"
+                 if efficiency['steady_state_throughput_samples_per_sec'] is not None else "n/a")
+    print(f"[SFP] Efficiency ({efficiency['device']}, bs={efficiency['batch_size']}): "
+          f"train compute {efficiency['train_compute_seconds']:.1f}s over {efficiency['epochs_trained']} epoch(s) "
+          f"(wall {efficiency['train_wall_seconds']:.1f}s incl. val)")
+    print(f"[SFP]   - Trainable params: {efficiency['trainable_params']:,} / {efficiency['total_params']:,} "
+          f"({efficiency['trainable_pct']:.2f}%)")
+    print(f"[SFP]   - Avg epoch: {efficiency['avg_epoch_compute_seconds']:.2f}s "
+          f"(1st {efficiency['first_epoch_compute_seconds']:.2f}s, steady {efficiency['steady_state_epoch_compute_seconds']:.2f}s)")
+    print(f"[SFP]   - Throughput: {tput_disp} samples/s (steady-state) | Peak GPU mem: {gpu_mem_disp}"
+          + (f" | Peak CPU RSS: {efficiency['peak_cpu_rss_mb']:.0f} MB" if efficiency['peak_cpu_rss_mb'] is not None else ""))
+    if args.save_misclassified_images:
+        print(f"[SFP] Misclassified images saved: {misclassified_saved} -> {misclassified_dir}")
+    print(f"[SFP] All plots, CSV history, and metrics JSON saved under: {output_dir}")
+    print(f"[SFP] Metrics summary JSON -> {summary_path}")
+    print(f"==================================================")
+
+
+if __name__ == "__main__":
+    main()
