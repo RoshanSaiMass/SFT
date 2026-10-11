@@ -3,13 +3,21 @@
 Branch **`sft_final_res`** combines the original SFT/PEFT, compact filters,
 block subtraction and LOO experiments. The four backend folders are preserved
 byte-for-byte from the previously verified code. The dedicated SNIP experiment
-(`SFT_SNIP_COMPACT`), its launcher, evaluator and old download bundles are excluded.
+(`SFT_SNIP_COMPACT`), its original launcher, evaluator and old download bundles are excluded.
 Original trainers retain their existing selection helpers; use `--pruned-block`
 for an explicit replacement position. Existing source branches are unchanged.
 
 Download [downloads/SFT-final-res.zip](downloads/SFT-final-res.zip), or use
 GitHub's **Code → Download ZIP** with `sft_final_res` selected. Extract it and run
 commands from the directory containing **`run.py`**.
+
+For separate campaigns using your existing `SFT_BEST`, `SFT_FINAL`, `SFT_EXP`,
+`SFT_LOO` and `SFT_COEFF_RED` cluster folders, see
+[slurm/research_suite/README.md](slurm/research_suite/README.md). Its seven A100
+arrays and master compiler create the requested result folders, CSV tables and
+PNG/SVG/PDF figures. A launcher can call the **external existing** SNIP backend;
+that backend's source remains excluded here. A standalone launcher download is
+available as [downloads/SFT-research-slurm-suite.zip](downloads/SFT-research-slurm-suite.zip).
 
 ## Repository contents
 
