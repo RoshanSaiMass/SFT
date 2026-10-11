@@ -1,3 +1,25 @@
+# New experiment: LOO compact replacement + targeted PEFT
+
+Branch **`sft-loo-compact`** adds `SFT_LOO_COMPACT` without changing the four existing
+backend folders or their branches. A shared classifier-only warm-up precedes
+independent block-removal loss measurements on cached training images. Minimum
+loss increase selects symbolic replacement; maximum surviving loss increase
+selects the original block for PEFT. Final training updates the filter, that
+block's PEFT parameters, all LayerNorms and task head; dense backbone weights
+stay frozen.
+
+```bash
+python3 run.py loo-compact --dataset pets --adapter-type lora --device cuda
+```
+
+See [the LOO workflow README](SFT_LOO_COMPACT/README.md) for exact semantics,
+all CLI flags, parameter denominators, assumptions and saved results.
+The A100 launcher is [slurm/run_loo_compact_a100.sh](slurm/run_loo_compact_a100.sh).
+`collect-all` includes LOO runs; `evaluate-loo-compact` restores saved checkpoints.
+Download [downloads/SFT-loo-compact.zip](downloads/SFT-loo-compact.zip) from this branch.
+
+---
+
 # New experiment: SNIP compact replacement + PEFT in the highest-score block
 
 Branch **`sft-snip-compact`** adds `SFT_SNIP_COMPACT`; previous branch refs and
