@@ -1,3 +1,22 @@
+# Downloadable LOO compact source
+
+`SFT-loo-compact.zip` contains source commit `54f897a969a095c2820f4a86fb00e6ae263918c8`,
+with top-level directory `SFT-loo-compact/`.
+
+SHA256: `df202d58d148ff598a69a0826f043ae4341a6b1e3194d46beecf097140acf005`
+
+Open this ZIP on branch **sft-loo-compact** and use GitHub's download button.
+It includes the new `SFT_LOO_COMPACT` workflow, common CLI, A100 array launcher,
+tests and the four unchanged existing backends. The archive excludes downloads,
+Git metadata, caches, datasets, checkpoints and generated results.
+
+Run `python3 run.py loo-compact --help`, and see `SFT_LOO_COMPACT/README.md`
+for classifier warm-up, independent removal-loss rankings, symbolic replacement,
+targeted PEFT and saved metrics. CRC integrity and the extracted training and
+evaluation CLI entry points were checked locally.
+
+---
+
 # Downloadable SNIP compact source
 
 `SFT-snip-compact.zip` contains the source tree at commit
