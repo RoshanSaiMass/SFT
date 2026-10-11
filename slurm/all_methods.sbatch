@@ -13,17 +13,17 @@ set -euo pipefail
 : "${SLURM_ARRAY_TASK_ID:?Submit this script through slurm/submit_all.sh}"
 manifest="${1:?The submission helper must pass manifest.json}"
 bootstrap_python="$(command -v python3 || command -v python)"
-code_dir="$("$bootstrap_python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["code_dir"])' "$manifest")"
+runner_path="$("$bootstrap_python" -c 'import json,sys; from pathlib import Path; m=json.load(open(sys.argv[1])); print(m.get("runner_path", str(Path(m["code_dir"])/"slurm"/"sweep.py")))' "$manifest")"
 record_setup_failure() {
     local rc=$?
     if (( rc != 0 )); then
-        "$bootstrap_python" "$code_dir/slurm/sweep.py" record-failure --manifest "$manifest" \
+        "$bootstrap_python" "$runner_path" record-failure --manifest "$manifest" \
             --task-id "$SLURM_ARRAY_TASK_ID" --returncode "$rc" \
             --error "Job environment setup failed; see the SLURM task error log" || true
     fi
 }
 trap record_setup_failure EXIT
-CONDA_ENV="${CONDA_ENV:-paca_env}"
+CONDA_ENV="${CONDA_ENV:-sft_env}"
 if [[ -n "${CONDA_SH:-}" ]]; then
     source "$CONDA_SH"
 elif command -v conda >/dev/null 2>&1; then
@@ -41,4 +41,4 @@ conda activate "$CONDA_ENV"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 export PYTHONUNBUFFERED=1
-exec python "$code_dir/slurm/sweep.py" task --manifest "$manifest" --task-id "$SLURM_ARRAY_TASK_ID"
+exec python "$runner_path" task --manifest "$manifest" --task-id "$SLURM_ARRAY_TASK_ID"

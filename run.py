@@ -10,8 +10,6 @@ ROOT = Path(__file__).resolve().parent
 ROUTES = {
     "loo-compact": ("SFT_LOO_COMPACT/train_loo_compact.py", []),
     "evaluate-loo-compact": ("tools/evaluate_loo_compact.py", []),
-    "snip-compact": ("SFT_SNIP_COMPACT/train_snip_compact.py", []),
-    "evaluate-snip-compact": ("tools/evaluate_snip_compact.py", []),
     "original": ("SFT_ORIGINAL/train_sfp_lora.py", []),
     "dense": ("SFT_ORIGINAL/train_sfp_lora.py", []),
     "lowrank": ("SFT_EXPERIEMTN/train_sfp_lora.py", ["--filter-type", "lowrank"]),
@@ -29,7 +27,7 @@ ROUTES = {
     "evaluate-removal": ("tools/evaluate_removal.py", []),
     "download-data": ("SFT_EXPERIEMTN/download_data.py", []),
 }
-TRAINING = {"loo-compact", "snip-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
+TRAINING = {"loo-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
 PATH_FLAGS = {"--data-dir", "--output-dir", "--output-root", "--root", "--out", "--out-dir",
               "--outdir", "--manifest", "--code-dir", "--cache-dir", "--data-root", "--summary"}
 

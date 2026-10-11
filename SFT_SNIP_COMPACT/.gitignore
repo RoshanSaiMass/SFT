@@ -1,9 +1,0 @@
-__pycache__/
-.pytest_cache/
-*.pyc
-data/
-outputs/
-compiled_results/
-*.pt
-*.pth
-.venv/

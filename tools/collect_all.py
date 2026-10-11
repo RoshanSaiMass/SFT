@@ -24,7 +24,7 @@ def collect(root, output):
         if summary.get("method") in ("drop-one", "correlation"):
             workflow = summary["method"]
             blocks = [summary["removed_block_idx"]]
-        elif summary.get("method") in ("snip-compact", "loo-compact"):
+        elif summary.get("method") == "loo-compact":
             workflow = summary["method"]
             blocks = summary["pruned_block_idx"]
         else:

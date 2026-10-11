@@ -1,136 +1,98 @@
-# A100 array for all supported datasets and methods
+# Launchers for sft_final_res
 
-Copy the supplied `slurm` folder beside your existing Python files in:
+Run integrated launchers from the repository root containing `run.py`, or export
+`CODE_DIR` to that root. A100 logs use `/export/home/achyut/Sarvesh/sflogs`;
+create this directory before submission. Integrated Conda default: `sft_env`.
 
-```text
-/export/home/achyut/Sarvesh/SFT_FINAL/
-    train_sfp_lora.py
-    requirements.txt
-    slurm/submit_all.sh
-    slurm/all_methods.sbatch
-    slurm/sweep.py
-```
-
-The launcher defaults to this code folder. It submits one array to `gpu-a100`, `node1`, with one GPU, eight CPUs, 220G RAM and 11:59:59 per task. It activates `paca_env` and checks CUDA before training. No cluster job has been submitted or GPU run verified from the cloud review environment.
-
-## Install once, then submit
-
-Use the cluster's existing CUDA-compatible torch/torchvision installation in `paca_env`; install the project's remaining dependencies there once. The array does not run pip in every job.
+| Launcher | Purpose |
+| --- | --- |
+| `run_integrated_a100.sh WORKFLOW FLAGS` | Any single A100 workflow |
+| `run_integrated_b200.sh WORKFLOW FLAGS` | Any single B200 workflow |
+| `run_correlation_a100.sh FLAGS` | Highest-correlation adjacent pair; Pets/LoRA default; no 0.9 cutoff |
+| `run_loo_compact_a100.sh FLAGS` | Eight LOO PEFT configurations for one dataset |
+| `run_loo_all_datasets_a100.sh FLAGS` | 13 datasets x eight LOO PEFT configurations = 104 tasks |
+| `run_integrated_removal_array_a100.sh MANIFEST` | One physical-removal candidate per task; default array 0..71 |
+| `submit_all.sh --training-budget fixed\|early\|both` | Original 13-dataset/20-configuration grid; automatic preparation/submission |
 
 ```bash
-cd /export/home/achyut/Sarvesh/SFT_FINAL
-conda activate paca_env
-python -m pip install -r requirements.txt scipy h5py gdown
+mkdir -p /export/home/achyut/Sarvesh/sflogs
+sbatch slurm/run_correlation_a100.sh --epochs 100
+sbatch slurm/run_loo_all_datasets_a100.sh --epochs 100
+sbatch --array=0 slurm/run_loo_compact_a100.sh --epochs -1
+sbatch slurm/run_integrated_a100.sh original --dataset pets --mode sft --pruned-block 3 --epochs 100 --device cuda
+```
 
-# Review the complete manifest without submitting anything.
-bash slurm/submit_all.sh --training-budget both --dry-run
+LOO/correlation default to early stopping (maximum 200 classification/recovery
+epochs, patience 10). `--epochs 100` uses fixed epochs. Both restore the best
+validation checkpoint. LOO has five classifier-only warm-up epochs; correlation
+has five feature-distillation epochs, additional to the main budget.
 
-# Submit one array covering both protocols.
+The LOO arrays include LoRA, DoRA, PaCA, RPaCA, PaCA+LoRA/DoRA and
+RPaCA+LoRA/DoRA, without Uni methods. The original grid additionally retains
+Uni methods, SFT, full fine-tuning, supported LoftQ and orthogonal variants.
+Ranks/parameter budgets differ by configuration and are saved in each summary.
+
+The 104-task array groups eight methods per dataset: tasks 0..7 are Pets,
+8..15 SVHN, 16..23 Flowers102, and so on. Its output root is
+`outputs/loo_all_ARRAY_JOB_ID/DATASET/METHOD/`. Prepare shared dataset/backbone
+caches before concurrent runs. `%4` permits up to four concurrent jobs and
+remains subject to the cluster's actual GPU/RAM availability.
+
+After completion:
+
+```bash
+python3 run.py collect-all
+# Or collect only one array:
+python3 run.py collect-all --root outputs/loo_all_JOBID --out compiled_results/loo_all_JOBID.csv
+```
+
+## Original grid
+
+The original submitter now locates this repository's helper separately from
+`SFT_ORIGINAL`, where the trainer resides. It creates logs before submission.
+One seed gives 260 tasks for one budget or 520 for both.
+
+```bash
+bash slurm/submit_all.sh --training-budget fixed --dry-run
 bash slurm/submit_all.sh --training-budget both
 ```
 
-The dry run creates its own sweep folder. The real submission creates a separate one and prints its manifest path and sbatch command. Log directories exist before sbatch is called. Submit through `submit_all.sh`, since it computes the array size and supplies the manifest; the batch file alone has no fixed array range.
+Overrides remain available: `SEEDS="18 42"`, `MAX_CONCURRENT=2`, `DATA_DIR`,
+`CACHE_DIR`, `OUTPUT_ROOT`, `CONDA_ENV`, `CONDA_SH`, `PREPARE_PYTHON`, `EPOCHS`,
+`MAX_EPOCHS`, `PATIENCE`, `BATCH_SIZE`, `NUM_SAMPLES` and `SAVE_MISCLASSIFIED`.
+For this submitter only, `CODE_DIR` means the **original trainer folder**, not
+the integrated root. It defaults to `REPO_ROOT/SFT_ORIGINAL`. Dataset/cache
+roots default to shared `REPO_ROOT/data`, and results to
+`REPO_ROOT/outputs/original_grid`. Manifests record `runner_path` separately.
 
-## Select the training protocol
-
-| Flag | Per-task training | Tasks with seed 18 |
-|---|---|---:|
-| `--training-budget fixed` | 100 epochs; cosine decay; restore best validation checkpoint | 260 |
-| `--training-budget early` | Early stopping: patience 10, maximum 200 epochs; cosine decay; restore best validation checkpoint | 260 |
-| `--training-budget both` | Separate tasks for each of the above protocols | 520 |
-
-`fixed` is the default. Each protocol is recorded separately in the manifest, task folders and aggregate statistics. Test evaluation happens after best-validation checkpoint restoration. Early stopping is an additional stopping rule, not a replacement for cosine scheduling.
-
-Examples for either protocol alone:
+Original-grid shared download locks and automatic result aggregation remain.
+You can refresh its aggregate CSV with:
 
 ```bash
-bash slurm/submit_all.sh --training-budget fixed
-bash slurm/submit_all.sh --training-budget early
+python3 run.py original-grid collect --manifest /absolute/path/manifest.json
 ```
 
-## Grid and settings
-
-All 13 supported datasets are included: pets, svhn, flowers102, dtd, caltech101, cifar100, fgvc_aircraft, eurosat, sun397, pcam, clevr, dsprites-loc and dsprites-ori. Existing dataset proxies and split rules are retained. Each run requests 1,000 samples, giving the existing 800/200 train/validation subset where enough samples exist; the existing test split is unchanged.
-
-The 20 named configurations are:
-
-| Configuration IDs | Meaning |
-|---|---|
-| `sft`, `full_finetune` | Plain SFP baseline; full fine-tuning baseline |
-| `lora`, `lora_loftq`, `lora_ortho` | SFP + LoRA: standard, LoftQ-style initialization, orthogonal regularization |
-| `dora`, `dora_loftq`, `dora_ortho` | Corresponding SFP + DoRA configurations |
-| `paca_direct`, `rpaca_direct` | SFP + direct selected-column adaptation |
-| `paca_lora`, `paca_dora`, `rpaca_lora`, `rpaca_dora` | SFP + fused column adaptation with the selected tuner |
-| `paca_lora_ortho`, `paca_dora_ortho`, `rpaca_lora_ortho`, `rpaca_dora_ortho` | Corresponding fused methods with orthogonal regularization |
-| `unilora`, `unidora` | SFP + shared-vector adaptation |
-
-These cover method families and named variants, not every combination of ranks or other hyperparameters. Except for full fine-tuning, each run uses the existing SNIP proxy to replace one block. This array does not sweep all 12 replacement positions. Adapter projection placement, family definitions and research qualifications are described in `PEFT_AUDIT.md`.
-
-Defaults: seed 18, batch size 32; LoRA/DoRA rank 32 with alpha 32; PaCA/RPaCA 32 columns with fused tuner rank 4; Uni methods rank 4 and shared dimension 72,000. Orthogonal variants use both penalties at 0.0001. Other optimizer/filter options retain trainer defaults, including full fine-tuning's automatic learning-rate adjustment. Parameter budgets differ by method; counts and efficiency measurements are saved for comparison.
-
-## Folders, caching and results
-
-The helper creates:
-
-```text
-SFT_FINAL/
-    data/                              shared dataset cache
-    outputs/
-        cache/                         shared pretrained/cache files
-        sweep_<UTC timestamp>_<id>/
-            manifest.json
-            manifest.csv
-            logs/<job_id>_<task_id>.out
-            logs/<job_id>_<task_id>.err
-            tasks/<id>_<dataset>_<config>_<budget>_seed18/
-                data -> shared dataset cache
-                status.json
-                results/<trainer run name>/
-                    best_sfp_lora_<dataset>.pt
-                    metrics_summary.json
-                    history.csv
-                    *.png
-            aggregate_summary.json
-            aggregate_summary.csv
-            aggregate_stats.csv
-            aggregate_summary.xlsx
-```
-
-Each task has a unique working directory and output tree. Shared download locks prevent simultaneous initial acquisition of the same dataset or backbone; dSprites tasks share their archive lock. Ready markers appear only after preparation succeeds. Uncached preparation needs network access on the compute node. The launcher uses your existing dataset code. If a large download was interrupted, repair its incomplete archive/extraction before retrying; a ready marker alone cannot repair a damaged cache.
-
-Aggregation runs automatically after each task. The last finishing task updates the final table; failed and waiting tasks remain visible, and statistics only use complete runs within the same dataset/configuration/protocol. You can refresh the table at any time using the exact path printed at submission:
+## Removal arrays and compact sweeps
 
 ```bash
-python slurm/sweep.py collect --manifest /absolute/path/to/sweep_folder/manifest.json
+python3 run.py removal-sweep --prepare-only --dataset pets --seeds 18 --epochs 100 --device cuda
+sbatch slurm/run_integrated_removal_array_a100.sh /absolute/path/manifest.json
+# After completion, select with validation and evaluate winners:
+python3 run.py collect-removals --root /absolute/path/removal_sweep_folder --seeds 18 --evaluate-selected --device cuda
 ```
 
-Jobs killed externally can leave a `running`/`preparing` state; use that task's SLURM status and logs to distinguish a live job from a timeout/cancellation. Failed jobs return a nonzero exit code. The full metrics remain in individual `metrics_summary.json` files.
+Override the array range when seeds/methods/blocks change. Missing candidates
+remain errors unless `--allow-partial` is explicitly chosen.
 
-Misclassified-image dumping defaults to off for this large grid; checkpoints, metrics, histories, plots and logs are saved. Set `SAVE_MISCLASSIFIED=true` to also save all wrong predictions. The full grid needs substantial disk space: hundreds of full-model checkpoints plus large datasets and their extraction archives. Use your cluster's scratch storage for caches/results if needed.
-
-## Optional overrides
+The compact all-position submitter remains in its backend:
 
 ```bash
-# Choose additional seeds and allow more tasks when cluster resources permit.
-SEEDS="18 42 123" MAX_CONCURRENT=2 bash slurm/submit_all.sh --training-budget fixed
-
-# Put large caches/results on scratch without changing Python split logic.
-DATA_DIR=/scratch/your_account/sft_data \
-CACHE_DIR=/scratch/your_account/sft_cache \
-OUTPUT_ROOT=/scratch/your_account/sft_results \
-bash slurm/submit_all.sh --training-budget both
-
-# Use a nonstandard Conda installation.
-CONDA_SH=/absolute/path/to/conda/etc/profile.d/conda.sh \
-CONDA_ENV=paca_env bash slurm/submit_all.sh --training-budget fixed
-
-# Change budgets/batch size explicitly.
-EPOCHS=100 MAX_EPOCHS=200 PATIENCE=10 BATCH_SIZE=32 \
-bash slurm/submit_all.sh --training-budget both
+CODE_DIR="$PWD/SFT_EXPERIEMTN" bash SFT_EXPERIEMTN/submit_block_sweep.sh --datasets pets cifar100 --ranks 16 --training-budget both
 ```
 
-`MAX_CONCURRENT=1` is the default. Additional seeds multiply the task count; the cluster must permit the resulting array range. `CODE_DIR` can override the source path, and `PREPARE_PYTHON` can choose the login-node interpreter used to create the manifest. Resource directives can be edited in `all_methods.sbatch`.
+A100 launchers request a GPU, including for collection if run there, matching
+the cluster's observed minimum-GRES requirement. Collection itself needs no GPU
+unless it evaluates checkpoints. B200 retains `mig90g`, `gpu:3g.90gb:1` and 64G;
+its log directory is `/home/achyutm01/SFT/sflogs`.
 
-## Verification
-
-The launch helpers passed 28 local tests, including all 20 method configurations against the actual trainer's CLI validation, task counts for both protocols, distinct result/statistics groups, quoted paths, child failures and collection. Both shell files pass `bash -n`. These checks do not submit a cluster job or verify a physical A100 run. The separately published PEFT code was checked read-only; no PEFT source changes accompany this launcher bundle.
+These launchers were checked locally; no cluster jobs are submitted by tests.

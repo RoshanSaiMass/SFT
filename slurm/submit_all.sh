@@ -2,10 +2,12 @@
 set -euo pipefail
 
 # One submission covers 13 datasets × 20 configurations × the requested seeds.
-CODE_DIR="${CODE_DIR:-/export/home/achyut/Sarvesh/SFT_FINAL}"
-DATA_DIR="${DATA_DIR:-$CODE_DIR/data}"
-CACHE_DIR="${CACHE_DIR:-$CODE_DIR/outputs/cache}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$CODE_DIR/outputs}"
+helper_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+repo_dir="$(dirname "$helper_dir")"
+CODE_DIR="${CODE_DIR:-$repo_dir/SFT_ORIGINAL}"
+DATA_DIR="${DATA_DIR:-$repo_dir/data}"
+CACHE_DIR="${CACHE_DIR:-$repo_dir/data/backbone_cache}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$repo_dir/outputs/original_grid}"
 PREPARE_PYTHON="${PREPARE_PYTHON:-python3}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-1}"
 if [[ ! "$MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
@@ -36,15 +38,15 @@ case "${SAVE_MISCLASSIFIED:-false}" in
     false|0|no) ;;
     *) echo "SAVE_MISCLASSIFIED must be true or false" >&2; exit 2 ;;
 esac
-sweep_root="$("$PREPARE_PYTHON" "$CODE_DIR/slurm/sweep.py" prepare "${prepare_args[@]}")"
+sweep_root="$("$PREPARE_PYTHON" "$helper_dir/sweep.py" prepare "${prepare_args[@]}")"
 manifest="$sweep_root/manifest.json"
 task_count="$("$PREPARE_PYTHON" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["tasks"]))' "$manifest")"
 command=(sbatch --array="0-$((task_count - 1))%$MAX_CONCURRENT"
          --output="$sweep_root/logs/%A_%a.out" --error="$sweep_root/logs/%A_%a.err"
-         "$CODE_DIR/slurm/all_methods.sbatch" "$manifest")
+         "$helper_dir/all_methods.sbatch" "$manifest")
 printf 'Prepared %s tasks: %s\n' "$task_count" "$manifest"
 printf 'Submission: '; printf '%q ' "${command[@]}"; printf '\n'
-printf 'Collect later: '; printf '%q ' "$PREPARE_PYTHON" "$CODE_DIR/slurm/sweep.py" collect --manifest "$manifest"; printf '\n'
+printf 'Collect later: '; printf '%q ' "$PREPARE_PYTHON" "$helper_dir/sweep.py" collect --manifest "$manifest"; printf '\n'
 if [[ "$dry_run" == true ]]; then exit 0; fi
 command -v sbatch >/dev/null || { echo "sbatch is unavailable on this host" >&2; exit 1; }
 "${command[@]}"

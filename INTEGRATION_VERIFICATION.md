@@ -1,3 +1,6 @@
+> Historical report for the earlier integrated branch. For the current final
+> repository, see [RESEARCH_VERIFICATION.md](RESEARCH_VERIFICATION.md).
+
 # Integration verification
 
 The integration branch merges `sft-experiment` at `9cc4fc0` and

@@ -1,0 +1,39 @@
+{
+  "branch": "sft_final_res",
+  "included_method_source_refs": {
+    "main": "0245af6e4ef0c97d2dd7ad614dd7edd1b2209e37",
+    "sft-experiment": "9cc4fc0f12400d3fdc449bb7245ce46b041569f0",
+    "sft-block-subtraction": "49ecab86012bb0b2678ba9cdbe2f2183a45d85c3",
+    "sft-integrated": "206ad14c4d5edcfba5b76769f9087e897a9407d8",
+    "sft-loo-compact": "a915b0215c04758e3c42f97ec3e59289f2145b56"
+  },
+  "preserved_backends": [
+    {
+      "folder": "SFT_ORIGINAL",
+      "source_snapshot": "a915b0215c04758e3c42f97ec3e59289f2145b56",
+      "source_tree": "9e6fa2941fb693797c890bc01cb6dca881d85b83",
+      "peft_sha256": "7a0298914cfb5ce869a1803104942e87197e677c6732540e77a7bd0ac1903733"
+    },
+    {
+      "folder": "SFT_EXPERIEMTN",
+      "source_snapshot": "a915b0215c04758e3c42f97ec3e59289f2145b56",
+      "source_tree": "55f7891f2861e3e3f49541d2bc5c606c11bde3cb",
+      "peft_sha256": "7a0298914cfb5ce869a1803104942e87197e677c6732540e77a7bd0ac1903733"
+    },
+    {
+      "folder": "SFT_BLOCK_SUBTRACTION",
+      "source_snapshot": "a915b0215c04758e3c42f97ec3e59289f2145b56",
+      "source_tree": "4046c9ac579ddc9c7ca12d4f623a273ec3631e6d",
+      "peft_sha256": "7a0298914cfb5ce869a1803104942e87197e677c6732540e77a7bd0ac1903733"
+    },
+    {
+      "folder": "SFT_LOO_COMPACT",
+      "source_snapshot": "a915b0215c04758e3c42f97ec3e59289f2145b56",
+      "source_tree": "d3e3c4f1d7c3d67ca4162ddf3b794dfc97ea2dfa",
+      "peft_sha256": "7a0298914cfb5ce869a1803104942e87197e677c6732540e77a7bd0ac1903733"
+    }
+  ],
+  "excluded_experiment_branch": "sft-snip-compact",
+  "excluded_experiment_folder": "SFT_SNIP_COMPACT",
+  "note": "Original selection helper modules remain in retained trainers; the dedicated SNIP experiment is excluded. Old archives are retained on their original branches, not in this final source bundle."
+}

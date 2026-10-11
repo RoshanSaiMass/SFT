@@ -18,7 +18,7 @@ set -eo pipefail
 source ~/.bashrc
 conda activate "${CONDA_ENV:-sft_env}"
 set -u
-cd "${CODE_DIR:-/export/home/achyut/Sarvesh/SFT_BEST}"
+cd "${CODE_DIR:-$SLURM_SUBMIT_DIR}"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
 case "${SLURM_ARRAY_TASK_ID:-0}" in

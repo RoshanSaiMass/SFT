@@ -101,6 +101,7 @@ def prepare(code_dir, data_dir, cache_dir, output_root, seeds=(18,), epochs=100,
                                       **method, task_dir=str(task_dir),
                                       train_args=common + method["method_args"]))
     manifest = dict(schema_version=1, created_utc=stamp, sweep_root=str(root),
+                    runner_path=str(Path(__file__).resolve()),
                     code_dir=str(code), data_dir=str(Path(data_dir).expanduser().resolve()),
                     cache_dir=str(Path(cache_dir).expanduser().resolve()),
                     settings=settings, seeds=list(seeds), tasks=tasks)
