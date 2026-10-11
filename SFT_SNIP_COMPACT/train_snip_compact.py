@@ -28,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 BACKBONE = "vit_base_patch16_224.augreg_in21k"
 DATASETS = ["pets", "svhn", "flowers102", "dtd", "caltech101", "cifar100", "fgvc_aircraft",
             "eurosat", "sun397", "pcam", "clevr", "dsprites-loc", "dsprites-ori"]
-ADAPTERS = ["lora", "dora", "paca", "rpaca"]
+ADAPTERS = ["none", "lora", "dora", "paca", "rpaca"]
 
 
 def write_json(path, value):
@@ -104,6 +104,8 @@ def validate(args, p=None):
         raise ValueError(message)
     if args.adapter_type not in ADAPTERS:
         error("Uni-LoRA and Uni-DoRA are excluded from this experiment.")
+    if args.adapter_type == "none" and (args.lora_ortho_lambda1 or args.lora_ortho_lambda2):
+        error("Orthogonality requires PEFT; adapter-type none has no adapters.")
     if not 1 <= args.filter_rank <= 768 or not 1 <= args.symbolic_max_terms <= 3:
         error("Filter rank must be 1..768 and symbolic terms 1..3.")
     if not math.isfinite(args.symbolic_penalty) or args.symbolic_penalty < 0:
@@ -146,6 +148,11 @@ def validate(args, p=None):
 
 
 def apply_top_peft(model, args, replaced, sensitive):
+    if args.adapter_type == "none":
+        freeze_non_trainable(model, [replaced])
+        return dict(replaced_original_index=replaced, adapter_original_indices=[],
+                    original_block_indices=list(range(len(model.blocks))), injected_adapter_params=0,
+                    policy="filter + all LayerNorms + task head; dense backbone frozen; no PEFT")
     if replaced == sensitive or not 0 <= sensitive < len(model.blocks):
         raise ValueError("PEFT target must be a surviving original block")
     excluded = set(range(len(model.blocks))) - {sensitive}
@@ -243,11 +250,15 @@ def _train(args, config, ident, output):
     write_json(output / "snip_search.json", selection)
     rows = [dict(block=i, score=score, score_source=selection["peft_score_source"],
                  compact_replaced=i == replaced, peft_target=i == sensitive)
-            for i, score in selection["target_scores"]["block_scores"].items()]
-    with (output / "snip_block_scores.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+            for i, score in (selection["target_scores"] or {}).get("block_scores", {}).items()]
+    if rows:
+        with (output / "snip_block_scores.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     print(f"[SNIP Compact] Replaced Block(s): [{replaced}]", flush=True)
-    print(f"[SNIP Compact] Original-ViT SNIP selected surviving block {sensitive}: {args.adapter_type}/{args.paca_tuner} PEFT only", flush=True)
+    if args.adapter_type == "none":
+        print("[SNIP Compact] No PEFT: train the selected filter, LayerNorms and task classifier only.", flush=True)
+    else:
+        print(f"[SNIP Compact] Original-ViT SNIP selected surviving block {sensitive}: {args.adapter_type}/{args.paca_tuner} PEFT only", flush=True)
     if selection["peft_target_changed_by_replacement"]:
         print("[SNIP Compact] Original highest-score block was replaced; using the highest-scoring surviving original block.", flush=True)
     optimizer = torch.optim.AdamW(build_optimizer_param_groups(model, args.lr, args.lora_lr),
@@ -325,7 +336,7 @@ def _train(args, config, ident, output):
     summary = dict(config=config, config_id=ident, backbone=BACKBONE, num_classes=classes,
                    dataset=args.dataset, seed=args.seed, method="snip-compact",
                    adapter_type=args.adapter_type, paca_tuner=args.paca_tuner,
-                   mode="snip_compact_top_peft", filter_type=args.filter_type,
+                   mode="snip_filter_only" if args.adapter_type == "none" else "snip_compact_top_peft", filter_type=args.filter_type,
                    structure=structure, pruned_block_idx=[replaced], replaced_block_idx=replaced,
                    peft_block_idx=sensitive, snip_selection=selection,
                    best_val_acc=best, best_epoch=best_epoch,

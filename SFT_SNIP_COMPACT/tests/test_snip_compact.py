@@ -249,3 +249,33 @@ def test_early_stopping_defers_test_until_explicit_evaluation(tmp_path, monkeypa
     result = train.evaluate_summary(path, "cpu")
     assert len(evaluated) == 3 and result["final_test_acc"] == 50.0
     assert result["test_evaluated"]
+
+
+def test_dense_paper_baseline_has_no_peft_or_original_block_scoring(tmp_path, monkeypatch, tiny_workflow):
+    import train_sfp_lora as old
+    monkeypatch.setattr(train, "get_dataloaders", old.get_dataloaders)
+    monkeypatch.setattr(train, "plot_training_curves", lambda *a, **k: {})
+    monkeypatch.setattr(train, "plot_lr_schedule", lambda *a, **k: "omitted")
+    monkeypatch.setattr(train, "plot_param_breakdown", lambda *a, **k: "omitted")
+    actual_scores = search.snip_scores
+    def candidate_only(model, loader, device):
+        assert any(isinstance(b, sf.SingleFilterBlock) for b in model.blocks)
+        return actual_scores(model, loader, device)
+    monkeypatch.setattr(search, "snip_scores", candidate_only)
+    args = arguments(("none", "direct", "default"), tmp_path, "dense")
+    path = train.train(args)
+    summary = json.loads(path.read_text())
+    assert summary["filter_type"] == "dense" and summary["mode"] == "snip_filter_only"
+    assert summary["peft_block_idx"] is None
+    assert summary["structure"]["adapter_original_indices"] == []
+    assert summary["snip_selection"]["target_scores"] is None
+    assert summary["snip_selection"]["search_complete"]
+    assert summary["param_breakdown"]["lora"] == 0
+    assert summary["param_breakdown"]["trainable_backbone"] == 0
+    model = train.restore_model(summary, "cpu")
+    assert not any(isinstance(m, ADAPTERS) for m in model.modules())
+    expected = {id(p) for p in model.blocks[summary["replaced_block_idx"]].parameters()}
+    expected.update(id(p) for m in model.modules() if isinstance(m, nn.LayerNorm) for p in m.parameters())
+    expected.update(id(p) for p in model.head.parameters())
+    assert {id(p) for p in model.parameters() if p.requires_grad} == expected
+    assert train.evaluate_summary(path, "cpu")["final_test_acc"] == summary["final_test_acc"]

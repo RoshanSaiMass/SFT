@@ -9,7 +9,7 @@ launchers retain their old behavior; they do not run this new experiment.
 
 1. Load the original pretrained ViT and preserve the existing dataset splits,
    augmentations, task classifier and sample budget.
-2. Cache 64 training images for pseudo-inverse initialization. Before replacing
+2. Cache 64 training images for pseudo-inverse initialization. For PEFT runs, before replacing
    or training anything, score the original ViT with its dataset task classifier
    on training calibration images. Save these original per-block SNIP scores
    separately for PEFT selection. Build one
@@ -75,7 +75,8 @@ python3 run.py snip-compact --dataset pets --seed 18 --device cuda \
 python3 run.py snip-compact --help
 ```
 
-Supported families: `lora`, `dora`, `paca`, `rpaca`. PaCA/RPaCA tuners:
+Supported families: `none`, `lora`, `dora`, `paca`, `rpaca`.
+`none` disables PEFT and its original-model block-ranking pass. PaCA/RPaCA tuners:
 `direct`, `lora`, `dora`. Supported standalone LoRA/DoRA initialization:
 `default`, `loftq`. Orthogonality penalties work for standalone and fused
 LoRA/DoRA, with `--lora-ortho-lambda1` and `--lora-ortho-lambda2`.
@@ -164,3 +165,28 @@ CPU tests exercise real gradients, candidate training/pruning, optimizer
 continuity, PEFT scope, frozen weights, checkpoint restoration and test
 evaluation on a tiny ViT. Full ViT training and A100/B200 accuracy still require
 your cluster run.
+
+## Traditional dense-filter baseline without PEFT
+
+Use `--filter-type dense --adapter-type none` to run paper-style substituted
+candidate SNIP/EMA search with the original single affine FC filter initialized
+by pseudo-inverse. Train only that filter, all LayerNorms and the existing task
+classifier. There is no symbolic filter, original-block PEFT ranking or adapter.
+The selected checkpoint is restored before test evaluation. `peft_block_idx`
+and PEFT-ranking metadata are null, and the PEFT parameter count is zero.
+The usual `snip_search.json` records the candidate search; no PEFT block-score
+CSV is produced because no PEFT ranking was performed.
+
+```bash
+python3 run.py snip-compact --filter-type dense --adapter-type none \
+  --dataset pets --seed 18 --device cuda
+
+mkdir -p /export/home/achyut/Sarvesh/sflogs
+sbatch slurm/run_snip_dense_baseline_a100.sh
+```
+
+The launcher uses `/export/home/achyut/Sarvesh/SFT_BEST` and saves each job under
+`outputs/snip_dense_baseline_JOBID`. It is one Slurm job; the search evaluates
+replacement candidates internally. Search defaults remain explicit local
+choices, so this is the paper-style mechanism, not a claim of exact published
+hyperparameters or accuracy.

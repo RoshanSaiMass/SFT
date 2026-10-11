@@ -9,10 +9,10 @@ PyTorch 2.14.1+cpu, timm 1.0.30 and pytest 9.1.1.
 | Original SFT / PEFT | 121 |
 | Existing compact workflow | 222 |
 | Block subtraction | 167 |
-| New folder, including inherited compact tests | 257 |
-| **Total** | **814** |
+| New folder, including inherited compact tests | 258 |
+| **Total** | **815** |
 
-Each suite ran in its own process. The new folder includes 35 new tests; its
+Each suite ran in its own process. The new folder includes 36 new tests; its
 other 222 tests verify the copied supporting implementation. Root tests also
 exercise the new trainer/evaluator help and CSV collection. All tests completed
 with no failures or skips. Source suites executed through
@@ -56,3 +56,12 @@ that the next-highest surviving original block receives PEFT, even when compact
 model block scores would choose a different target. The unchanged other-suite
 results above remain from their preceding runs; they were not rerun for this
 localized update. GPU accuracy is still untested.
+
+## No-PEFT dense baseline
+
+After adding `--adapter-type none`, the new-folder suite passed 258 tests.
+A complete dense-filter baseline test confirms that scoring only visits
+substituted candidates, there are no PEFT wrappers or trainable dense backbone
+weights, only filter/LayerNorm/classifier parameters train, and the saved
+checkpoint restores and reproduces test accuracy. The new A100 baseline
+launcher passed `bash -n`; it was not submitted to the cluster.

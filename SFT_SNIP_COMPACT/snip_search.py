@@ -144,10 +144,12 @@ def select_compact_candidate(base, train_loader, calibration_dataset, args):
         raise ValueError("Compact initialization requires 64 training calibration images")
     # PEFT ranking is measured on the original model, before replacement or
     # candidate fitting. It is independent of the compact filter's gradients.
-    with seeded_stream(args.seed, train_loader, args.device):
-        base.to(args.device)
-        original_scores = snip_scores(base, scoring, args.device)
-    original_scores["source"] = "original_vit_before_replacement_and_training"
+    original_scores = None
+    if args.adapter_type != "none":
+        with seeded_stream(args.seed, train_loader, args.device):
+            base.to(args.device)
+            original_scores = snip_scores(base, scoring, args.device)
+        original_scores["source"] = "original_vit_before_replacement_and_training"
     base = base.cpu()
     states, fit_reports, averages, history, optimizers = {}, {}, {}, [], {}
     for index in range(len(base.blocks)):
@@ -205,11 +207,11 @@ def select_compact_candidate(base, train_loader, calibration_dataset, args):
     with seeded_stream(args.seed, train_loader, args.device):
         model = restore_candidate(base, args, index, states[index])
     model.blocks[index].fit_report = fit_reports[index]
-    original_highest = select_sensitive_block(original_scores["block_scores"], None)
-    sensitive = select_sensitive_block(original_scores["block_scores"], index)
+    original_highest = select_sensitive_block(original_scores["block_scores"], None) if original_scores else None
+    sensitive = select_sensitive_block(original_scores["block_scores"], index) if original_scores else None
     return model, dict(selection="paper-candidates", replaced_block=index, sensitive_block=sensitive,
                        target_scores=original_scores, search_history=history,
-                       peft_score_source=original_scores["source"], original_highest_block=original_highest,
+                       peft_score_source=original_scores["source"] if original_scores else None, original_highest_block=original_highest,
                        peft_target_changed_by_replacement=original_highest == index,
                        fit_report=fit_reports[index], search_epochs_applied=len(history),
                        selected_candidate_ema=averages[index], search_complete=True,
