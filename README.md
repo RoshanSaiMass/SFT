@@ -1,5 +1,15 @@
 # Final SFT research repository
 
+Branch **`sft-loo-all-blocks-rank4`** adds the separate
+[`SFT_LOO_ALL_PEFT`](SFT_LOO_ALL_PEFT/README.md) experiment: training-only LOO
+selects a rank-16 symbolic replacement and rank-4 LoRA adapts all 11 surviving
+blocks. Start with `python3 run.py loo-all-peft --dataset pets --device cuda`.
+The standalone all-dataset A100 launcher is
+[`slurm/run_loo_all_peft_a100.slurm`](slurm/run_loo_all_peft_a100.slurm).
+Existing backend folders and source branches are preserved.
+Download the new experiment and its Slurm launcher from
+[`downloads/SFT-loo-all-blocks-rank4.zip`](downloads/SFT-loo-all-blocks-rank4.zip).
+
 Branch **`sft_final_res`** combines the original SFT/PEFT, compact filters,
 block subtraction and LOO experiments. The four backend folders are preserved
 byte-for-byte from the previously verified code. The dedicated SNIP experiment
@@ -27,6 +37,7 @@ available as [downloads/SFT-research-slurm-suite.zip](downloads/SFT-research-slu
 | `SFT_EXPERIEMTN` | Dense, low-rank and bounded symbolic replacement filters; grids and block sweeps |
 | `SFT_BLOCK_SUBTRACTION` | Highest-correlation adjacent-pair reduction; independent one-block removal and validation selection |
 | `SFT_LOO_COMPACT` | LOO loss screening; symbolic replacement at minimum loss increase; targeted PEFT at maximum surviving loss increase |
+| `SFT_LOO_ALL_PEFT` | LOO-selected rank-16 symbolic replacement; rank-4 LoRA on all surviving original blocks |
 | `slurm` | A100/B200 launchers, original all-method grid and all-dataset LOO array |
 | `tools` | Saved-checkpoint evaluators, CSV/log collectors and isolated test runner |
 
