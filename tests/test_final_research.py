@@ -19,17 +19,16 @@ def module(path, name):
     return value
 
 
-def test_dedicated_snip_experiment_is_not_packaged_or_routed():
-    assert not (ROOT / "SFT_SNIP_COMPACT").exists()
-    assert not (ROOT / "tools/evaluate_snip_compact.py").exists()
-    assert not (ROOT / "slurm/run_snip_dense_baseline_a100.sh").exists()
-    assert not (ROOT / "downloads/SFT-snip-compact.zip").exists()
+def test_final_combined_branch_packages_and_routes_sequential_snip():
+    assert (ROOT / "SFT_SNIP_COMPACT/train_snip_compact.py").is_file()
+    assert (ROOT / "tools/evaluate_snip_final.py").is_file()
+    assert (ROOT / "scheduler/01_snip_only.slurm").is_file()
     for name in ("snip-compact", "evaluate-snip-compact"):
-        with pytest.raises(ValueError, match="Unknown workflow"):
-            run.build_command(name, [])
+        command, cwd = run.build_command(name, [])
+        assert Path(command[2]).is_file()
     result = subprocess.run([sys.executable, str(ROOT / "run.py"), "--help"],
                             capture_output=True, text=True, check=True)
-    assert "snip-compact" not in result.stdout
+    assert "snip-compact" in result.stdout
     for name in ("original", "symbolic", "lowrank", "correlation", "drop-one", "loo-compact"):
         assert name in result.stdout
 

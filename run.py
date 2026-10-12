@@ -8,6 +8,8 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 ROUTES = {
+    "snip-compact": ("SFT_SNIP_COMPACT/train_snip_compact.py", []),
+    "evaluate-snip-compact": ("tools/evaluate_snip_final.py", []),
     "loo-all-peft": ("SFT_LOO_ALL_PEFT/train_loo_all_peft.py", []),
     "evaluate-loo-all-peft": ("tools/evaluate_loo_all_peft.py", []),
     "loo-compact": ("SFT_LOO_COMPACT/train_loo_compact.py", []),
@@ -29,7 +31,7 @@ ROUTES = {
     "evaluate-removal": ("tools/evaluate_removal.py", []),
     "download-data": ("SFT_EXPERIEMTN/download_data.py", []),
 }
-TRAINING = {"loo-all-peft", "loo-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
+TRAINING = {"snip-compact", "loo-all-peft", "loo-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
 PATH_FLAGS = {"--data-dir", "--output-dir", "--output-root", "--root", "--out", "--out-dir",
               "--outdir", "--manifest", "--code-dir", "--cache-dir", "--data-root", "--summary"}
 

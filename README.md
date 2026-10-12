@@ -1,33 +1,31 @@
-# Final SFT research repository
+# SFT_FINAL_RESEARCH
 
-Branch **`sft-loo-all-blocks-rank4`** adds the separate
-[`SFT_LOO_ALL_PEFT`](SFT_LOO_ALL_PEFT/README.md) experiment: training-only LOO
-selects a rank-16 symbolic replacement and rank-4 LoRA adapts all 11 surviving
-blocks. Start with `python3 run.py loo-all-peft --dataset pets --device cuda`.
-The standalone all-dataset A100 launcher is
-[`slurm/run_loo_all_peft_a100.slurm`](slurm/run_loo_all_peft_a100.slurm).
-Existing backend folders and source branches are preserved.
-Download the new experiment and its Slurm launcher from
-[`downloads/SFT-loo-all-blocks-rank4.zip`](downloads/SFT-loo-all-blocks-rank4.zip).
+Branch **`SFT_FINAL_RESEARCH`** combines all implemented SFT research workflows:
+original dense SFT/PEFT, low-rank and symbolic compact filters, correlation and
+one-block subtraction, one-block LOO PEFT, all-block LOO rank-4 LoRA, and
+sequential SNIP with dense/compact replacement and optional targeted PEFT.
+IA3 has only been discussed and is not implemented.
 
-Branch **`sft_final_res`** combines the original SFT/PEFT, compact filters,
-block subtraction and LOO experiments. The four backend folders are preserved
-byte-for-byte from the previously verified code. The dedicated SNIP experiment
-(`SFT_SNIP_COMPACT`), its original launcher, evaluator and old download bundles are excluded.
-Original trainers retain their existing selection helpers; use `--pruned-block`
-for an explicit replacement position. Existing source branches are unchanged.
+The original backend folders and previously published branches are unchanged.
+The restored SNIP backend uses one candidate elimination per epoch, requiring
+11 search epochs for 12 candidate positions. Paper-identical results and full
+protocol reproduction are not established.
 
-Download [downloads/SFT-final-res.zip](downloads/SFT-final-res.zip), or use
-GitHub's **Code → Download ZIP** with `sft_final_res` selected. Extract it and run
-commands from the directory containing **`run.py`**.
+Download [`downloads/SFT_FINAL_RESEARCH.zip`](downloads/SFT_FINAL_RESEARCH.zip)
+or use GitHub's **Code > Download ZIP** on this branch. Keep the repository
+folders together. The primary launchers are in
+[`scheduler`](scheduler/README.md), including all seven main types and two extras.
+Ranks, datasets, methods and training budgets are submission-time CLI flags.
 
-For separate campaigns using your existing `SFT_BEST`, `SFT_FINAL`, `SFT_EXP`,
-`SFT_LOO` and `SFT_COEFF_RED` cluster folders, see
-[slurm/research_suite/README.md](slurm/research_suite/README.md). Its seven A100
-arrays and master compiler create the requested result folders, CSV tables and
-PNG/SVG/PDF figures. A launcher can call the **external existing** SNIP backend;
-that backend's source remains excluded here. A standalone launcher download is
-available as [downloads/SFT-research-slurm-suite.zip](downloads/SFT-research-slurm-suite.zip).
+```bash
+bash scheduler/submit_all.sh --groups loo --campaign loo64_18 \
+  --filter-rank 64 --lora-rank 32 --dora-rank 32 \
+  --paca-rank 128 --paca-adapter-rank 64
+```
+
+Existing `slurm/` files are retained as legacy launchers; use the new scheduler
+for this combined branch. The new helpers locate this repository's backends
+rather than relying on older separate source folders on the cluster.
 
 ## Repository contents
 
@@ -38,6 +36,7 @@ available as [downloads/SFT-research-slurm-suite.zip](downloads/SFT-research-slu
 | `SFT_BLOCK_SUBTRACTION` | Highest-correlation adjacent-pair reduction; independent one-block removal and validation selection |
 | `SFT_LOO_COMPACT` | LOO loss screening; symbolic replacement at minimum loss increase; targeted PEFT at maximum surviving loss increase |
 | `SFT_LOO_ALL_PEFT` | LOO-selected rank-16 symbolic replacement; rank-4 LoRA on all surviving original blocks |
+| `SFT_SNIP_COMPACT` | Sequential candidate SNIP for dense/compact replacement; optional original-block SNIP for targeted PEFT |
 | `slurm` | A100/B200 launchers, original all-method grid and all-dataset LOO array |
 | `tools` | Saved-checkpoint evaluators, CSV/log collectors and isolated test runner |
 
