@@ -6,10 +6,24 @@ one-block subtraction, one-block LOO PEFT, all-block LOO rank-4 LoRA, and
 sequential SNIP with dense/compact replacement and optional targeted PEFT.
 IA3 has only been discussed and is not implemented.
 
-The original backend folders and previously published branches are unchanged.
+The original dense backend and previously published branches are unchanged.
 The restored SNIP backend uses one candidate elimination per epoch, requiring
 11 search epochs for 12 candidate positions. Paper-identical results and full
 protocol reproduction are not established.
+
+Targeted LOO now supports a nine-function symbolic library (including GELU,
+SiLU and Softsign) and `--symbolic-max-terms 1..9`. With nine terms allowed it
+compares 511 function subsets; this does not force all functions into the filter.
+The function IDs of older checkpoints are preserved. Reconstruct checkpoints
+with their saved maximum term count.
+
+Dense SNIP candidate initialization now uses a source-precision SVD cutoff
+rather than applying float64's default cutoff to promoted float32 observations.
+Scoring differentiates the same label-smoothed loss used for candidate training.
+`snip_search.json` records each candidate's initialization rank/weight norm/error
+and per-round saliency components and scoring loss. This is a numerical fix,
+not a guarantee of a different block selection or paper-equivalent accuracy.
+Use a new campaign/output directory when comparing against old runs.
 
 Download [`downloads/SFT_FINAL_RESEARCH.zip`](downloads/SFT_FINAL_RESEARCH.zip)
 or use GitHub's **Code > Download ZIP** on this branch. Keep the repository
@@ -26,6 +40,12 @@ bash scheduler/submit_all.sh --groups loo --campaign loo64_18 \
 Existing `slurm/` files are retained as legacy launchers; use the new scheduler
 for this combined branch. The new helpers locate this repository's backends
 rather than relying on older separate source folders on the cluster.
+
+```bash
+bash scheduler/submit_all.sh --groups loo --methods lora \
+  --campaign loo128_r8_terms9 --filter-rank 128 --lora-rank 8 \
+  --symbolic-max-terms 9
+```
 
 ## Repository contents
 

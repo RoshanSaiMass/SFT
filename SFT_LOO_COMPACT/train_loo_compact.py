@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 
 from data import get_dataloaders
 from calibration import calibration_images
+from compressed_filters import OPERATORS
 from loo_selection import select_compact_candidate, install_compact
 from single_filter_lora import (count_parameter_breakdown, compute_lora_orthogonality_loss,
                                 inject_lora, freeze_non_trainable, resample_all_paca)
@@ -106,8 +107,8 @@ def validate(args, p=None):
         error("Uni-LoRA and Uni-DoRA are excluded from this experiment.")
     if args.adapter_type == "none" and (args.lora_ortho_lambda1 or args.lora_ortho_lambda2):
         error("Orthogonality requires PEFT; adapter-type none has no adapters.")
-    if not 1 <= args.filter_rank <= 768 or not 1 <= args.symbolic_max_terms <= 3:
-        error("Filter rank must be 1..768 and symbolic terms 1..3.")
+    if not 1 <= args.filter_rank <= 768 or not 1 <= args.symbolic_max_terms <= len(OPERATORS):
+        error(f"Filter rank must be 1..768 and symbolic terms 1..{len(OPERATORS)}.")
     if not math.isfinite(args.symbolic_penalty) or args.symbolic_penalty < 0:
         error("Symbolic penalty must be finite and nonnegative.")
     if args.epochs != -1 and args.epochs <= 0:

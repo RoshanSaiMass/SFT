@@ -381,6 +381,8 @@ def main():
     p.add_argument('--no-evaluate-selected', action='store_true',
                    help='Compile without evaluating validation-selected removal checkpoints')
     args = p.parse_args()
+    if args.action != 'task' and args.group and not args.groups:
+        args.groups = [args.group]
     import math
     if not 1 <= args.filter_rank <= 768 or not 1 <= args.paca_rank <= 768:
         p.error('Filter and PaCA ranks must be 1..768')
@@ -390,7 +392,7 @@ def main():
         p.error('Alpha must be finite and positive')
     if args.snip_search_epochs < 11 or not 0 <= args.snip_momentum < 1:
         p.error('Sequential SNIP needs at least 11 search epochs and momentum in [0,1)')
-    if not 1 <= args.symbolic_max_terms <= 3 or not math.isfinite(args.symbolic_penalty) or args.symbolic_penalty < 0:
+    if not 1 <= args.symbolic_max_terms <= 9 or not math.isfinite(args.symbolic_penalty) or args.symbolic_penalty < 0:
         p.error('Invalid symbolic settings')
     if min(args.symbolic_search_tokens,args.loo_samples,args.snip_samples) < 1:
         p.error('Calibration sample and token counts must be positive')
@@ -400,6 +402,8 @@ def main():
     if args.methods and len(set(args.methods)) != len(args.methods):
         p.error('Method names must be unique')
     for group in args.groups or ([args.group] if args.group else MAIN_GROUPS):
+        if args.symbolic_max_terms > 3 and group != 'loo':
+            p.error('Term limits 4..9 are currently supported by targeted LOO only; use --groups loo')
         for task in tasks(group, settings):
             name, flags = task['method'], task['method_flags']
             if '--paca-adapter-rank' in flags and int(flags[flags.index('--paca-adapter-rank')+1]) > args.paca_rank:

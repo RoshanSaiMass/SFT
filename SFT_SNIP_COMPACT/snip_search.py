@@ -32,24 +32,28 @@ def seeded_stream(seed, loader, device):
             loader.generator.set_state(state)
 
 
-def snip_scores(model, loader, device):
-    """Eq. 8/9: sum |theta * d(mean CE)/dtheta| across the whole network.
+def snip_scores(model, loader, device, label_smoothing=0.0, replaced=None):
+    """Sum |theta * d(mean training CE)/dtheta| across the whole network.
 
     Temporarily differentiate frozen weights as well, without optimizer updates.
     Microbatches accumulate gradients before the absolute product so their result
     matches one calibration loss. Existing .grad values, flags and modes survive.
     """
-    parameters = list(model.parameters())
+    named = list(model.named_parameters())
+    parameters = [p for _, p in named]
     flags = [p.requires_grad for p in parameters]
     modes = {m: m.training for m in model.modules()}
-    accumulated, samples = [None] * len(parameters), 0
+    accumulated, samples, loss_sum, correct = [None] * len(parameters), 0, 0.0, 0
     try:
         for p in parameters:
             p.requires_grad_(True)
         model.eval()
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            loss = nn.functional.cross_entropy(model(x), y, reduction="sum")
+            logits = model(x)
+            loss = nn.functional.cross_entropy(
+                logits, y, reduction="sum", label_smoothing=label_smoothing
+            )
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite SNIP calibration loss")
             gradients = torch.autograd.grad(loss, parameters, allow_unused=True)
@@ -61,6 +65,8 @@ def snip_scores(model, loader, device):
                         else:
                             accumulated[i].add_(gradient.detach())
             samples += len(x)
+            loss_sum += float(loss.detach())
+            correct += int((logits.argmax(-1) == y).sum())
         if not samples:
             raise ValueError("Empty SNIP calibration loader")
         by_id = {}
@@ -71,8 +77,28 @@ def snip_scores(model, loader, device):
                     raise FloatingPointError("Nonfinite SNIP score")
                 by_id[id(p)] = score
         blocks = {i: sum(by_id[id(p)] for p in block.parameters()) for i, block in enumerate(model.blocks)}
+        ln_ids = {id(p) for module in model.modules() if isinstance(module, nn.LayerNorm)
+                  for p in module.parameters()}
+        components = dict(filter=0.0, layernorm=0.0, head=0.0,
+                          remaining_blocks=0.0, stem_cls_position=0.0)
+        for name, p in named:
+            if replaced is not None and name.startswith(f"blocks.{replaced}."):
+                group = "filter"
+            elif id(p) in ln_ids:
+                group = "layernorm"
+            elif name.startswith("head.") or name.startswith("head_dist."):
+                group = "head"
+            elif name.startswith("blocks."):
+                group = "remaining_blocks"
+            else:
+                group = "stem_cls_position"
+            components[group] += by_id[id(p)]
         return dict(network_score=sum(by_id.values()), block_scores=blocks, samples=samples,
-                    formula="sum(abs(theta * grad(mean_cross_entropy)))")
+                    formula="sum(abs(theta * grad(mean_cross_entropy)))",
+                    label_smoothing=label_smoothing, scoring_loss=loss_sum / samples,
+                    scoring_accuracy=100 * correct / samples, component_scores=components,
+                    trainable_snip=sum(by_id[id(p)] for p, flag in zip(parameters, flags) if flag),
+                    frozen_snip=sum(by_id[id(p)] for p, flag in zip(parameters, flags) if not flag))
     finally:
         for p, flag in zip(parameters, flags):
             p.requires_grad_(flag)
@@ -111,11 +137,56 @@ def restore_candidate(base, args, index, snapshot):
     return model
 
 
+@torch.no_grad()
+def initialize_dense_filter(block, x, y):
+    """Float64 SVD with a cutoff based on the captured feature precision.
+
+    Promoting float32 observations does not create float64-quality observations.
+    This cutoff is a documented numerical choice, not a paper-specified value.
+    """
+    dtype = x.dtype
+    a = x.reshape(-1, x.shape[-1]).double()
+    b = y.reshape(-1, y.shape[-1]).double()
+    if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        raise FloatingPointError("Nonfinite dense-filter calibration features")
+    u, singular, vh = torch.linalg.svd(a, full_matrices=False)
+    rtol = max(a.shape) * torch.finfo(dtype).eps
+    keep = singular > singular[0] * rtol
+    rank = int(keep.sum())
+    if not rank:
+        raise ValueError("No feature directions survive the precision-aware pseudoinverse cutoff")
+    inverse = torch.zeros_like(singular)
+    inverse[keep] = singular[keep].reciprocal()
+    weight = (vh.T * inverse) @ (u.T @ b)
+    if not torch.isfinite(weight).all():
+        raise FloatingPointError("Nonfinite dense-filter pseudoinverse weights")
+    block.weight.copy_(weight.T.to(block.weight))
+    block.bias.zero_()
+    prediction = block(x.to(block.weight)).double()
+    error = (prediction - y.to(prediction)).square()
+    full_condition = float(singular[0] / singular[-1]) if singular[-1] > 0 else None
+    block.fit_report = dict(
+        type="dense", initialization="precision_aware_svd_pseudoinverse",
+        source_dtype=str(dtype), solve_dtype="torch.float64", pinv_rtol=rtol,
+        effective_rank=rank, feature_width=a.shape[-1], calibration_tokens=len(a),
+        input_condition_number=full_condition if full_condition is None or math.isfinite(full_condition) else None,
+        retained_condition_number=float(singular[0] / singular[keep][-1]),
+        singular_max=float(singular[0]), singular_min=float(singular[-1]),
+        weight_norm=float(block.weight.double().norm()), initialization_mse=float(error.mean()),
+        cls_mse=float(error[:, 0].mean()) if x.ndim == 3 else None,
+        patch_mse=float(error[:, 1:].mean()) if x.ndim == 3 and x.shape[1] > 1 else None,
+        cutoff_is_paper_specified=False,
+    )
+
+
 def initialize_candidate(base, args, index, calibration):
     model = copy.deepcopy(base).to(args.device)
     x, y = extract_block_inputs_outputs(model, calibration, index, args.device)
     block = install_compact(model, args, index)
-    block.init_from_pinv(x.to(args.device), y.to(args.device))
+    if args.filter_type == "dense":
+        initialize_dense_filter(block, x.to(args.device), y.to(args.device))
+    else:
+        block.init_from_pinv(x.to(args.device), y.to(args.device))
     freeze_non_trainable(model, [index])
     return model
 
@@ -155,7 +226,8 @@ def select_compact_candidate(base, train_loader, calibration_dataset, args):
     if args.adapter_type != "none":
         with seeded_stream(args.seed, train_loader, args.device):
             base.to(args.device)
-            original_scores = snip_scores(base, scoring, args.device)
+            original_scores = snip_scores(base, scoring, args.device,
+                                          label_smoothing=args.label_smoothing)
         original_scores["source"] = "original_vit_before_replacement_and_training"
     base = base.cpu()
     states, fit_reports, averages, history, optimizers = {}, {}, {}, [], {}
@@ -186,16 +258,26 @@ def select_compact_candidate(base, train_loader, calibration_dataset, args):
                     loss = criterion(model(x), y)
                     if not torch.isfinite(loss):
                         raise FloatingPointError("Nonfinite candidate training loss")
-                    loss.backward(); optimizer.step()
+                    loss.backward()
+                    if args.grad_clip:
+                        nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.grad_clip)
+                    optimizer.step()
                     total += float(loss.detach()) * len(x); samples += len(x); steps += 1
             if not samples:
                 raise ValueError("Empty candidate training loader")
-            score = snip_scores(model, scoring, args.device)["network_score"]
+            measured = snip_scores(model, scoring, args.device,
+                                   label_smoothing=args.label_smoothing, replaced=index)
+            score = measured["network_score"]
             averages[index] = args.snip_momentum * averages[index] + (1 - args.snip_momentum) * score
             states[index] = snapshot_candidate(model, index)
             optimizers[index] = cpu_optimizer_state(optimizer)
             rows.append(dict(candidate_block=index, network_snip=score, ema=averages[index],
-                             train_loss=total / samples, train_samples=samples, optimizer_steps=steps))
+                             train_loss=total / samples, train_samples=samples, optimizer_steps=steps,
+                             scoring_loss=measured.get("scoring_loss"), scoring_accuracy=measured.get("scoring_accuracy"),
+                             component_scores=measured.get("component_scores"),
+                             trainable_snip=measured.get("trainable_snip"), frozen_snip=measured.get("frozen_snip"),
+                             filter_weight_norm=math.sqrt(sum(float(p.detach().double().square().sum())
+                                                            for p in model.blocks[index].parameters()))))
             del model, optimizer
         ordered = sorted(alive, key=lambda index: (-averages[index], index))
         survivors, pruned = ordered[:-1], ordered[-1:]
@@ -220,9 +302,14 @@ def select_compact_candidate(base, train_loader, calibration_dataset, args):
                        peft_score_source=original_scores["source"] if original_scores else None, original_highest_block=original_highest,
                        peft_target_changed_by_replacement=original_highest == index,
                        fit_report=fit_reports[index], search_epochs_applied=len(history),
+                       candidate_initialization=fit_reports, implementation_version="snip_precision_aware_v4",
+                       label_smoothing=args.label_smoothing,
+                       scoring_gradient_scope="all_network_parameters_including_frozen_weights",
                        pruning_rule="one_lowest_network_snip_ema_candidate_per_epoch",
                        candidates_pruned_per_epoch=1, required_search_epochs=required_epochs,
                        selected_candidate_ema=averages[index], search_complete=True,
                        optimizer_continuity=True, reused_winning_candidate=True,
                        paper_equations=[8, 9, 10], init_images=64, scoring_images=len(score_data),
-                       protocol_notes="Compact replacement and explicit search defaults are extensions; not full paper reproduction.")
+                       protocol_notes="Dense initialization uses a source-precision cutoff; scoring uses the training loss. "
+                                      "Frozen-weight scoring scope and other search defaults are implementation choices; "
+                                      "not full paper reproduction.")

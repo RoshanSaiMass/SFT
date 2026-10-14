@@ -125,6 +125,25 @@ def test_invalid_rank_settings_rejected(flags):
     assert result.returncode!=0
 
 
+def test_targeted_loo_scheduler_routes_nine_terms_and_rejects_unsupported_backends(tmp_path):
+    script = str(ROOT / 'tools/research_scheduler.py')
+    result = subprocess.run([sys.executable, script, 'prepare', '--group', 'loo',
+        '--datasets', 'pets', '--methods', 'lora', '--filter-rank', '128', '--lora-rank', '8',
+        '--symbolic-max-terms', '9', '--results-root', str(tmp_path), '--campaign', 'nine_terms'],
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifests = list(tmp_path.rglob('manifest.json'))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert manifest['settings']['symbolic_max_terms'] == 9
+    task = manifest['tasks'][0]
+    argv, _ = suite.command(task, manifest['settings'], suite.destination(task, manifest['settings']))
+    assert argv[argv.index('--symbolic-max-terms') + 1] == '9'
+    result = subprocess.run([sys.executable, script, 'counts', '--group', 'snip_only',
+                             '--symbolic-max-terms', '9'], capture_output=True, text=True)
+    assert result.returncode != 0 and 'targeted LOO only' in result.stderr
+
+
 def test_new_compiler_handles_extra_groups_and_validation_selection(tmp_path):
     import compile_final_research as compiler
     import csv

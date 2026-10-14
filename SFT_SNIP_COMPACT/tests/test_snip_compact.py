@@ -106,15 +106,15 @@ def test_training_search_scope_and_checkpoint(case, filter_type, tmp_path, monke
         return state
     monkeypatch.setattr(search, "cpu_optimizer_state", checked_snapshot)
     original_scoring = search.snip_scores
-    expected_original = original_scoring(original, DataLoader(dataset(), batch_size=16), "cpu")
+    expected_original = original_scoring(original, DataLoader(dataset(), batch_size=16), "cpu", label_smoothing=0.1)
     scoring_models = []
-    def checked_scoring(model, loader, device):
+    def checked_scoring(model, loader, device, **kwargs):
         unchanged_architecture = all(type(b) is type(original.blocks[i])
                                      for i, b in enumerate(model.blocks))
         scoring_models.append("original" if unchanged_architecture else "candidate")
         if unchanged_architecture:
             assert all(torch.equal(value, saved[name]) for name, value in model.state_dict().items())
-        return original_scoring(model, loader, device)
+        return original_scoring(model, loader, device, **kwargs)
     monkeypatch.setattr(search, "snip_scores", checked_scoring)
     args = arguments(case, tmp_path, filter_type)
     path = train.train(args)
@@ -180,7 +180,7 @@ def test_training_search_scope_and_checkpoint(case, filter_type, tmp_path, monke
 def test_collision_uses_next_original_score_without_changing_compact_search(tmp_path, monkeypatch):
     base = tiny()
     args = arguments(("lora", "direct", "default"), tmp_path)
-    def scores(model, loader, device):
+    def scores(model, loader, device, **kwargs):
         compact_index = next((i for i, block in enumerate(model.blocks)
                               if type(block) is not type(base.blocks[i])), None)
         if compact_index is None:
@@ -236,7 +236,7 @@ def test_twelve_candidates_remove_exactly_one_each_epoch(tmp_path, monkeypatch, 
     args.snip_momentum = 0.3
     scores = {i: 1.0 if tied else float((i * 7) % 12 + 1) for i in range(12)}
     calls, optimizer_steps = [], []
-    def controlled_score(model, loader, device):
+    def controlled_score(model, loader, device, **kwargs):
         index = next(i for i, b in enumerate(model.blocks) if isinstance(b, sf.SingleFilterBlock))
         calls.append(index)
         return dict(network_score=scores[index], block_scores={}, samples=64)
@@ -322,9 +322,9 @@ def test_dense_paper_baseline_has_no_peft_or_original_block_scoring(tmp_path, mo
     monkeypatch.setattr(train, "plot_lr_schedule", lambda *a, **k: "omitted")
     monkeypatch.setattr(train, "plot_param_breakdown", lambda *a, **k: "omitted")
     actual_scores = search.snip_scores
-    def candidate_only(model, loader, device):
+    def candidate_only(model, loader, device, **kwargs):
         assert any(isinstance(b, sf.SingleFilterBlock) for b in model.blocks)
-        return actual_scores(model, loader, device)
+        return actual_scores(model, loader, device, **kwargs)
     monkeypatch.setattr(search, "snip_scores", candidate_only)
     args = arguments(("none", "direct", "default"), tmp_path, "dense")
     path = train.train(args)

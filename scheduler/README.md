@@ -56,6 +56,15 @@ Other flags include `--compact-type dense|lowrank|symbolic`, `--loo-samples`,
 `--seed`, `--methods`, `--datasets`, `--campaign`, `--results-root`,
 `--chunk-size` and `--concurrency`.
 
+Targeted LOO (`--groups loo`) accepts `--symbolic-max-terms 1..9` with the
+expanded nine-function library. Other backends retain their existing 1..3
+term limit. For example:
+
+```bash
+bash scheduler/submit_all.sh --groups loo --methods lora --campaign loo128_r8_t9 \
+  --filter-rank 128 --lora-rank 8 --symbolic-max-terms 9
+```
+
 ## Submit
 
 The existing `sft_env` CUDA environment and datasets must be available. On the

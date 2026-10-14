@@ -1,9 +1,18 @@
 # LOO compact replacement and targeted PEFT
 
-This is a separate experiment on branch `sft-loo-compact`. The four previous
-backend folders and their GitHub branches are unchanged. Dataset split logic,
-symbolic-filter math and PEFT implementations are copied without modification
-from `sft-snip-compact` commit `214e43f`.
+This experiment was introduced on branch `sft-loo-compact`. In the combined
+`SFT_FINAL_RESEARCH` branch, the symbolic library now includes GELU, SiLU and
+Softsign in addition to the original six functions. Dataset split logic, LOO
+position selection, and PEFT implementations retain their existing behavior.
+
+`--symbolic-max-terms` accepts 1..9. A nine-term limit searches all 511 nonempty
+subsets; the penalized held-out reconstruction criterion can still select fewer
+terms. At a fixed rank and maximum term count, expanding the function library
+adds no trainable parameters. Increasing the maximum count allocates extra
+coefficient rows, whether or not they are selected.
+
+The original six operator IDs are preserved for old checkpoints. Load checkpoints
+using their recorded maximum term count; changing that count changes tensor shapes.
 
 ## Procedure
 

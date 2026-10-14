@@ -9,7 +9,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-OPERATORS = ("linear", "square", "cube", "tanh", "sin", "constant")
+# Append new operators: the original six IDs must stay unchanged so existing
+# checkpoints still decode their saved operator_ids correctly.
+OPERATORS = (
+    "linear", "square", "cube", "tanh", "sin", "constant",
+    "gelu", "silu", "softsign",
+)
 
 
 def basis(z, operator):
@@ -25,6 +30,12 @@ def basis(z, operator):
         return z.sin()
     if operator == "constant":
         return torch.ones_like(z)
+    if operator == "gelu":
+        return F.gelu(z, approximate="none")
+    if operator == "silu":
+        return F.silu(z)
+    if operator == "softsign":
+        return F.softsign(z)
     raise ValueError(operator)
 
 
@@ -95,8 +106,11 @@ class SymbolicFilterBlock(nn.Module):
         super().__init__()
         if not 1 <= rank <= embed_dim:
             raise ValueError("Filter rank must be between 1 and embedding dimension.")
-        if not 1 <= max_terms <= 3 or penalty < 0 or search_tokens < 1:
-            raise ValueError("Require 1..3 terms, nonnegative penalty, positive search token cap.")
+        if not 1 <= max_terms <= len(OPERATORS) or penalty < 0 or search_tokens < 1:
+            raise ValueError(
+                f"Require 1..{len(OPERATORS)} terms, nonnegative penalty, "
+                "positive search token cap."
+            )
         self.embed_dim, self.rank = embed_dim, rank
         self.max_terms, self.penalty = max_terms, penalty
         self.search_tokens, self.seed = search_tokens, seed
@@ -180,6 +194,7 @@ class SymbolicFilterBlock(nn.Module):
         self.train(was_training)
         self.fit_report = {
             "search_split": "75/25 by training calibration image; no validation/test images",
+            "operator_library": list(OPERATORS),
             "fit_images": len(fit_images), "heldout_images": len(check_images),
             "fit_tokens": len(a), "heldout_tokens": len(c), "refit_tokens": len(all_x),
             "selected_terms": list(terms), "heldout_mse_before_refit": heldout_mse,
