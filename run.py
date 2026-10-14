@@ -8,6 +8,9 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 ROUTES = {
+    "num_function": ("SFT_NUM_FUNCTION/train_num_function.py", []),
+    "num-function": ("SFT_NUM_FUNCTION/train_num_function.py", []),
+    "evaluate-num-function": ("tools/evaluate_num_function.py", []),
     "snip-compact": ("SFT_SNIP_COMPACT/train_snip_compact.py", []),
     "evaluate-snip-compact": ("tools/evaluate_snip_final.py", []),
     "loo-all-peft": ("SFT_LOO_ALL_PEFT/train_loo_all_peft.py", []),
@@ -31,7 +34,7 @@ ROUTES = {
     "evaluate-removal": ("tools/evaluate_removal.py", []),
     "download-data": ("SFT_EXPERIEMTN/download_data.py", []),
 }
-TRAINING = {"snip-compact", "loo-all-peft", "loo-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
+TRAINING = {"num_function", "num-function", "snip-compact", "loo-all-peft", "loo-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
 PATH_FLAGS = {"--data-dir", "--output-dir", "--output-root", "--root", "--out", "--out-dir",
               "--outdir", "--manifest", "--code-dir", "--cache-dir", "--data-root", "--summary"}
 
@@ -83,7 +86,7 @@ def build_command(workflow, flags, caller=None):
             defaults.extend([key, str(value)])
     if workflow in TRAINING:
         default("--data-dir", ROOT / "data")
-        family = "original" if workflow == "dense" else workflow
+        family = "original" if workflow == "dense" else "num_function" if workflow == "num-function" else workflow
         default("--output-dir", ROOT / "outputs" / family)
         if workflow in ("lowrank", "symbolic"):
             peft_flags = ("--adapter-type", "--lora-rank", "--paca-tuner", "--paca-rank",

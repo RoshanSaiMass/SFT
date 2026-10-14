@@ -1,4 +1,22 @@
-# SFT_FINAL_RESEARCH
+# num_function research branch
+
+This branch adds the separate `num_function` method in
+[`SFT_NUM_FUNCTION`](SFT_NUM_FUNCTION/README.md): select **exactly N function terms**
+with `--num-functions N`, using LOO-selected compact replacement and one-block
+targeted PEFT. The existing maximum-term method is preserved. For additive
+expressions the search enumerates combinations, not duplicate permutations.
+Counts 3/5/7/9 examine 84/126/36/1 candidates respectively.
+
+```bash
+python3 run.py num_function --dataset pets --num-functions 3 --filter-rank 128 \
+  --adapter-type lora --lora-rank 8 --lora-alpha 16 --epochs -1 --device cuda
+```
+
+Download this branch using **Code > Download ZIP**. The older
+`downloads/SFT_FINAL_RESEARCH.zip` is the preceding branch's bundle and does not
+contain this new backend.
+
+## Included baseline workflows
 
 Branch **`SFT_FINAL_RESEARCH`** combines all implemented SFT research workflows:
 original dense SFT/PEFT, low-rank and symbolic compact filters, correlation and
@@ -25,8 +43,8 @@ and per-round saliency components and scoring loss. This is a numerical fix,
 not a guarantee of a different block selection or paper-equivalent accuracy.
 Use a new campaign/output directory when comparing against old runs.
 
-Download [`downloads/SFT_FINAL_RESEARCH.zip`](downloads/SFT_FINAL_RESEARCH.zip)
-or use GitHub's **Code > Download ZIP** on this branch. Keep the repository
+Use GitHub's **Code > Download ZIP** on the `num_function` branch. Earlier
+archives in `downloads/` are historical snapshots. Keep the repository
 folders together. The primary launchers are in
 [`scheduler`](scheduler/README.md), including all seven main types and two extras.
 Ranks, datasets, methods and training budgets are submission-time CLI flags.
@@ -51,6 +69,7 @@ bash scheduler/submit_all.sh --groups loo --methods lora \
 
 | Folder | Included methods |
 | --- | --- |
+| `SFT_NUM_FUNCTION` | Exactly N symbolic terms; LOO-selected replacement and single-block targeted PEFT |
 | `SFT_ORIGINAL` | Original dense SFP filter, SFT/PEFT, full fine-tuning reference |
 | `SFT_EXPERIEMTN` | Dense, low-rank and bounded symbolic replacement filters; grids and block sweeps |
 | `SFT_BLOCK_SUBTRACTION` | Highest-correlation adjacent-pair reduction; independent one-block removal and validation selection |
