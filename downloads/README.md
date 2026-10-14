@@ -1,4 +1,23 @@
-# Final research source download
+# Research source downloads
+
+## Current combined branch: SFT_FINAL_RESEARCH
+
+[SFT_FINAL_RESEARCH.zip](SFT_FINAL_RESEARCH.zip) contains the combined backends,
+including precision-aware dense SNIP initialization and the expanded targeted
+LOO symbolic library with up to nine terms. The archive excludes nested download
+bundles, Git metadata, datasets, weights and generated results.
+
+- Source commit: `ae23c824f866f7faa3259819c0f7040af1e18c74`
+- SHA256: `f35768837d526f99b45257c7334afa79a5b4477b335a6a27d895d5fe9250085d`
+- Size: 810,024 bytes
+
+Validation: 275 CPU checks passed across SNIP, targeted LOO, and root
+integration suites. Archive CRC, extracted CLI help and updated-file identity
+checks passed. GPU training and accuracy were not reproduced. The source
+commit precedes the publication commit because this downloads directory is
+excluded from the source archive.
+
+## Earlier branch bundles
 
 `SFT-final-res.zip` is the current source bundle for branch `sft_final_res`.
 It includes the four retained backends, common CLI, launchers, examples and tests.
