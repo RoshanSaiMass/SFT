@@ -39,6 +39,68 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def save_checkpoint_verified(state, checkpoint):
+    """Flush, verify, then publish; preserve the previous best on failure."""
+    checkpoint = Path(checkpoint)
+    temporary = checkpoint.with_name(f"{checkpoint.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            torch.save(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if temporary.stat().st_size == 0:
+            raise OSError("Checkpoint writer produced a zero-byte file")
+        verified = torch.load(temporary, map_location="cpu", weights_only=True)
+        expected_weights = state["state_dict"] if state.get("format") == "num_function_trainable_v1" else state
+        actual_weights = verified["state_dict"] if verified.get("format") == "num_function_trainable_v1" else verified
+        if set(actual_weights) != set(expected_weights) or any(
+            actual_weights[name].shape != value.shape or actual_weights[name].dtype != value.dtype
+            for name, value in expected_weights.items()
+        ):
+            raise OSError("Checkpoint read-back did not match state keys/shapes/dtypes")
+        del verified
+        temporary.replace(checkpoint)
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Checkpoint save/verification failed: {checkpoint}. "
+            "Check available space, user quota, and filesystem errors before resubmitting."
+        ) from exc
+
+
+def checkpoint_payload(model, args):
+    """Save changed weights and buffers; reconstruct the immutable pretrained base."""
+    state = model.state_dict()
+    if args.checkpoint_format == "full":
+        return state
+    names = {name for name, p in model.named_parameters() if p.requires_grad}
+    names.update(name for name, _ in model.named_buffers())
+    # LoftQ changes frozen base parameters in adapted layers during initialization.
+    if args.init_method == "loftq":
+        names.update(name for name in state if ".base_layer." in name)
+    weights = {name: value.detach().cpu().clone() for name, value in state.items() if name in names}
+    return dict(format="num_function_trainable_v1", backbone=BACKBONE,
+                state_dict=weights, init_method=args.init_method,
+                num_classes=model.num_classes, requires_pretrained_backbone=True)
+
+
+def load_checkpoint_state(model, payload):
+    if payload.get("format") != "num_function_trainable_v1":
+        model.load_state_dict(payload)
+        return
+    weights = payload["state_dict"]
+    required = {name for name, p in model.named_parameters() if p.requires_grad}
+    required.update(name for name, _ in model.named_buffers())
+    if payload.get("init_method") == "loftq":
+        required.update(name for name in model.state_dict() if ".base_layer." in name)
+    required.intersection_update(model.state_dict())
+    if not required.issubset(weights):
+        raise RuntimeError(f"Compact checkpoint is missing required state: {sorted(required - weights.keys())}")
+    incompatible = model.load_state_dict(weights, strict=False)
+    if incompatible.unexpected_keys:
+        raise RuntimeError(f"Unexpected compact checkpoint keys: {incompatible.unexpected_keys}")
+
+
 def configuration_id(config):
     ignored = {"output_dir", "defer_test", "overwrite", "save_misclassified_images", "max_misclassified_images"}
     payload = {k: v for k, v in config.items() if k not in ignored}
@@ -96,6 +158,8 @@ def parser():
                    nargs="?", const=True, default=False)
     p.add_argument("--max-misclassified-images", type=int, default=-1)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--checkpoint-format", choices=["trainable", "full"], default="trainable",
+                   help="Trainable weights and buffers by default; full also stores the frozen backbone.")
     return p
 
 
@@ -172,12 +236,16 @@ def resample_rpaca(model, optimizer):
 def restore_model(summary, device=None):
     args = argparse.Namespace(**summary["config"])
     target_device = device or args.device
-    model = timm.create_model(summary["backbone"], pretrained=False, num_classes=summary["num_classes"])
+    payload = torch.load(summary["checkpoint_path"], map_location="cpu", weights_only=True)
+    compact = payload.get("format") == "num_function_trainable_v1"
+    if compact and payload["backbone"] != summary["backbone"]:
+        raise RuntimeError("Checkpoint and summary pretrained backbones differ")
+    model = timm.create_model(summary["backbone"], pretrained=compact, num_classes=summary["num_classes"])
     model.to(target_device)
     replaced = summary["replaced_block_idx"]
     install_compact(model, args, replaced)
     apply_top_peft(model, args, replaced, summary["peft_block_idx"])
-    model.load_state_dict(torch.load(summary["checkpoint_path"], map_location=target_device, weights_only=True))
+    load_checkpoint_state(model, payload)
     model.eval()
     return model
 
@@ -315,9 +383,9 @@ def _train(args, config, ident, output):
         for key, value in values.items():
             history[key].append(value)
         if val_acc > best:
+            save_checkpoint_verified(checkpoint_payload(model, args), checkpoint)
             best, best_epoch, stale = val_acc, epoch, 0
-            temporary = checkpoint.with_suffix(".pt.tmp")
-            torch.save(model.state_dict(), temporary); temporary.replace(checkpoint)
+            print(f"[Checkpoint] Verified best epoch {best_epoch}: {checkpoint.stat().st_size} bytes", flush=True)
         else:
             stale += 1
         scheduler.step()
@@ -329,7 +397,9 @@ def _train(args, config, ident, output):
     train_wall_s = time.perf_counter() - training_start
     peak_allocated = torch.cuda.max_memory_allocated(args.device) / 2**20 if use_cuda else None
     peak_reserved = torch.cuda.max_memory_reserved(args.device) / 2**20 if use_cuda else None
-    model.load_state_dict(torch.load(checkpoint, map_location=args.device, weights_only=True))
+    if not checkpoint.is_file() or checkpoint.stat().st_size == 0:
+        raise RuntimeError(f"Best checkpoint is missing or empty: {checkpoint}; test evaluation cannot proceed.")
+    load_checkpoint_state(model, torch.load(checkpoint, map_location="cpu", weights_only=True))
     model.eval()
     breakdown = count_parameter_breakdown(model, [replaced])
     plots = plot_training_curves(history, str(output), dataset_name=args.dataset)
@@ -354,6 +424,8 @@ def _train(args, config, ident, output):
                    trainable_pct_original=100 * breakdown["trainable_params"] / original_params,
                    total_reduction_pct=100 * (1 - breakdown["total_params"] / original_params),
                    checkpoint_bytes=checkpoint.stat().st_size,
+                   checkpoint_format=args.checkpoint_format,
+                   checkpoint_requires_pretrained_backbone=args.checkpoint_format == "trainable",
                    efficiency=dict(loo_selection_s=search_s,
                                    head_warmup_s=selection["head_warmup"]["wall_s"],
                                    loo_screening_s=selection["screening_s"],

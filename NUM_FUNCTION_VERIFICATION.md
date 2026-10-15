@@ -34,3 +34,15 @@ reproduction. More selected functions can have small coefficients and need not
 improve accuracy. With nine functions selected there is one structure and only
 coefficient fitting/projection training remain. No exhaustive permutation search
 is needed because the additive expression is invariant to term order.
+
+Checkpoint storage update: `--checkpoint-format trainable` is now the default.
+It saves trainable parameters and all persistent model buffers, plus frozen
+adapter base parameters modified by LoftQ. Restoring reconstructs the original
+pretrained backbone using timm; retain the pretrained cache and the run summary.
+`--checkpoint-format full` retains standalone full-state checkpoints and existing
+full-state checkpoints remain readable. This changes storage, not trainable scope.
+Each best checkpoint is flushed, synced, and read back before atomically replacing
+the previous best. Empty, truncated, out-of-space and sync-error writes are tested.
+The reported cluster had `/export` at 100% capacity with 12 MB free; this must be
+resolved before resubmission. Smaller checkpoints cannot repair existing empty
+files or remove the need for available disk space.
