@@ -8,6 +8,8 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 ROUTES = {
+    "loo-bottleneck": ("SFT_LOO_BOTTLENECK/train_bottleneck.py", []),
+    "evaluate-loo-bottleneck": ("tools/evaluate_bottleneck.py", []),
     "num_function": ("SFT_NUM_FUNCTION/train_num_function.py", []),
     "num-function": ("SFT_NUM_FUNCTION/train_num_function.py", []),
     "evaluate-num-function": ("tools/evaluate_num_function.py", []),
@@ -34,7 +36,7 @@ ROUTES = {
     "evaluate-removal": ("tools/evaluate_removal.py", []),
     "download-data": ("SFT_EXPERIEMTN/download_data.py", []),
 }
-TRAINING = {"num_function", "num-function", "snip-compact", "loo-all-peft", "loo-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
+TRAINING = {"loo-bottleneck", "num_function", "num-function", "snip-compact", "loo-all-peft", "loo-compact", "original", "dense", "lowrank", "symbolic", "correlation", "drop-one", "removal-sweep"}
 PATH_FLAGS = {"--data-dir", "--output-dir", "--output-root", "--root", "--out", "--out-dir",
               "--outdir", "--manifest", "--code-dir", "--cache-dir", "--data-root", "--summary"}
 

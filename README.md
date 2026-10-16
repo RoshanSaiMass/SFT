@@ -1,3 +1,5 @@
+New separate experiment: [LOO GELU bottleneck + targeted PEFT](SFT_LOO_BOTTLENECK/README.md), with an independent [A100 launcher](scheduler/loo_bottleneck.slurm).
+
 # num_function research branch
 
 This branch adds the separate `num_function` method in
